@@ -7,6 +7,8 @@ find_package(ament_cmake REQUIRED)
 # per mettere lo script nell'eseguibile
 install(PROGRAMS
   GeneticLineTracker.py
+  model.py
+  optimizer.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
