@@ -27,10 +27,9 @@ class Model:
 
     def cost_function(self, controls, current_state, target_line):
         """
-        Simula 'horizon' passi nel futuro con Forward Euler e calcola il costo.
+        simula 'horizon' passi nel futuro con Forward Euler e calcola il costo.
  
-        Parametri
-        ---------
+        Parametri:
         controls        : array [v0, w0, v1, w1, ..., vN, wN]
         current_state   : [x, y, theta] — stato attuale nel frame robot
         target_line     : coefficienti polinomio [a, b, c] per y = ax² + bx + c
@@ -77,26 +76,22 @@ class Model:
 
     def solve(self, current_state, target_line):
         """Usa scipy.minimize per trovare i controlli (v, omega) ottimali"""
-        # Guess iniziale dei controlli futuri
-        target_line_der = np.polyder(target_line)  # precalcolato una volta sola
- 
-        # ------------------------------------------------------------------
-        # Warm-start: se esiste una soluzione precedente, shiftala di 1 passo
-        # [v0,w0, v1,w1, ..., vN,wN] → [v1,w1, ..., vN,wN, vN,wN]
-        # ------------------------------------------------------------------
+
+        # warm-start: se esiste una soluzione precedente, shiftala di 1 passo
+        # [v0,w0, v1,w1, ..., vN,wN] -> [v1,w1, ..., vN,wN, vN,wN]
         if self._last_solution is not None and len(self._last_solution) == self.horizon * 2:
             controls0 = np.roll(self._last_solution, -2)
-            # L'ultimo passo ripete l'ultimo comando (assunzione stazionaria)
+            # l'ultimo passo ripete l'ultimo comando (assunzione stazionaria)
             controls0[-2] = self._last_solution[-2]
             controls0[-1] = self._last_solution[-1]
         else:
-            controls0          = np.zeros(self.horizon * 2)
-            controls0[0::2]    = self.v_target
+            controls0 = np.zeros(self.horizon * 2)
+            controls0[0::2] = self.v_target
  
         bounds = []
         for _ in range(self.horizon):
-            bounds.append((0.0,          self.v_max))   # v ∈ [0, v_max]
-            bounds.append((-self.w_max,  self.w_max))   # ω ∈ [-w_max, w_max]
+            bounds.append((0.0,          self.v_max))   # v in [0, v_max]
+            bounds.append((-self.w_max,  self.w_max))   # w in [-w_max, w_max]
  
         res = minimize(
             self.cost_function,

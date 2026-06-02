@@ -41,8 +41,7 @@ class GeneticLineTracker(Node):
         self.mpc = Model()
         #trovati lanciando optimizer.py
         #self.mpc.set_weights([3.0, 3.0, 0.1, 0.5])  # w_d == w_psi, bilanciati
-        self.mpc.set_weights([1.687, 7.124, 0.373, 0.007])  # w_d == w_psi, bilanciati
-        
+        self.mpc.set_weights([2.208, 7.748, 0.455, 1.444])
         self.get_logger().info("MPC Node Initialized. Waiting for Odometry...")
 
     def odom_callback(self, msg):
