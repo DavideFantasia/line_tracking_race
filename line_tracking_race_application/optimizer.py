@@ -2,29 +2,34 @@ import pygad
 import numpy as np
 import math
 from model import Model
+import json
 
-# Deviazioni standard del rumore che simula l'incertezza della camera.
-# Valori calibrati sull'errore tipico del polyfit su Gazebo:
-#   - coefficiente quadratico (a): rumore piccolo, raramente sbaglia molto
-#   - coefficiente lineare  (b): rumore medio, dipende dall'angolo di vista
-#   - termine noto          (c): rumore più alto, offset laterale più incerto
+RANDOM_SEED = 42
+
+# deviazioni standard del rumore che simula l'incertezza della camera.
+#   - coefficiente quadratico   (a): rumore piccolo, raramente sbaglia molto
+#   - coefficiente lineare      (b): rumore medio, dipende dall'angolo di vista
+#   - termine noto              (c): rumore più alto, offset laterale più incerto
 NOISE_STD_A = 0.005
 NOISE_STD_B = 0.02
 NOISE_STD_C = 0.05
  
-# Numero di realizzazioni di rumore per ogni scenario.
-# Ogni individuo viene valutato N_NOISE_SAMPLES volte con rumore diverso
+# ogni individuo viene valutato N_NOISE_SAMPLES volte con rumore diverso
 # e si usa la media degli errori come fitness. Questo forza il GA a trovare
 # pesi ROBUSTI invece di pesi ottimali solo in condizioni ideali.
-# Aumentare questo valore migliora la robustezza ma moltiplica il tempo di training.
+# valore alto => migliora la robustezza | moltiplica il tempo di training.
 N_NOISE_SAMPLES = 3
  
-# Delay in step tra il calcolo del comando e la sua applicazione.
-# Simula la latenza ROS (topic /cmd_vel, scheduling del timer).
+# simula la latenza ROS (topic /cmd_vel, scheduling del timer).
 # Con dt=0.05s e CMD_DELAY=2, il robot esegue il comando calcolato 100ms prima.
 CMD_DELAY = 2
  
 TRAINING_STEPS = 25  # step per scenario — 25*0.05s = 1.25s di simulazione
+
+# parametri per simulare e penalizzare l'uscita dal terreno
+TRACK_HALF_WIDTH = 1.0
+SOFT_MARGIN = 0.7       # inizia a penalizzare già oltre questo valore
+OUT_PENALTY = 2.0
  
 def simulate_scenario(mpc, initial_state, target_poly, noisy_poly):
     """
@@ -38,42 +43,45 @@ def simulate_scenario(mpc, initial_state, target_poly, noisy_poly):
     """
     state = initial_state.copy()
     
-    # Buffer FIFO per la latenza dei comandi: i primi CMD_DELAY step
+    # FIFO queue per la latenza dei comandi: i primi CMD_DELAY step
     # il robot sta fermo (comandi zero), poi inizia ad eseguire con ritardo.
     cmd_buffer = [(0.0, 0.0)] * CMD_DELAY
  
     scenario_error = 0.0
     target_poly_der = np.polyder(target_poly)  # derivata precalcolata della linea REALE
  
-    for _ in range(TRAINING_STEPS):
-        # ----------------------------------------------------------
-        # 1. Il robot "vede" la linea con rumore e calcola il comando
-        # ----------------------------------------------------------
+    for step in range(TRAINING_STEPS):
+        # il robot "vede" la linea con rumore e calcola il comando
         v_cmd, w_cmd = mpc.solve(state, target_line=noisy_poly)
- 
-        # ----------------------------------------------------------
-        # 2. Aggiunge il comando al buffer e preleva quello in ritardo
-        # ----------------------------------------------------------
+        
+        # aggiunge il comando al buffer e preleva quello in ritardo
         cmd_buffer.append((v_cmd, w_cmd))
         v_applied, w_applied = cmd_buffer.pop(0)  # esegue il comando di CMD_DELAY step fa
  
-        # ----------------------------------------------------------
-        # 3. Cinematica con il comando ritardato (quello che Gazebo farebbe)
-        # ----------------------------------------------------------
+        # kinematica con il comando ritardato
         state[0] += mpc.dt * math.cos(state[2]) * v_applied
         state[1] += mpc.dt * math.sin(state[2]) * v_applied
         state[2] += mpc.dt * w_applied
  
-        # ----------------------------------------------------------
-        # 4. Errore misurato sulla linea REALE (non quella rumorosa)
-        # ----------------------------------------------------------
+        # errore misurato sulla linea non rumorosa
         y_target    = np.polyval(target_poly, state[0])
         dy_dx       = np.polyval(target_poly_der, state[0])
         theta_target = math.atan2(dy_dx, 1.0)
  
         y_err   = abs(state[1] - y_target)
         psi_err = abs((state[2] - theta_target + math.pi) % (2 * math.pi) - math.pi)
-        scenario_error += y_err + psi_err
+        
+        # penalita progressiva dalla soft margin in poi
+        lateral_excess = max(0.0, abs(state[1]) - SOFT_MARGIN)
+
+        scenario_error += y_err + psi_err + 5.0 * lateral_excess
+
+        # terminazione anticipata oltre il bordo fisico
+        if abs(state[1]) > TRACK_HALF_WIDTH:
+            #errore proporzionale a quanto in fretta si butta di sotto
+            remaining = TRAINING_STEPS - step - 1
+            scenario_error += OUT_PENALTY * remaining
+            break
  
     return scenario_error
  
@@ -82,9 +90,9 @@ def fitness_func(ga_instance, solution, solution_idx):
     """
     Funzione di fitness. 'solution' è l'array dei 4 pesi [w_d, w_psi, w_effort, w_v].
  
-    Ogni individuo viene valutato su 4 scenari × N_NOISE_SAMPLES realizzazioni di rumore.
-    La fitness è l'inverso dell'errore medio — massimizzarla significa minimizzare
-    l'errore medio su tutti gli scenari e su tutte le realizzazioni di rumore.
+    Ogni individuo viene valutato su 4 scenari per N_NOISE_SAMPLES realizzazioni di rumore.
+    La fitness è l'inverso dell'errore medio
+    l'errore medio valutato su tutti gli scenari e su tutte le realizzazioni di rumore.
     """
     mpc = Model()
     mpc.set_weights(solution)
@@ -92,10 +100,8 @@ def fitness_func(ga_instance, solution, solution_idx):
     total_error = 0.0
  
     for _ in range(N_NOISE_SAMPLES):
-        # ------------------------------------------------------------------
-        # Campiona una realizzazione di rumore per questa valutazione.
-        # Il rumore è additivo sui coefficienti del polinomio percepito.
-        # ------------------------------------------------------------------
+        
+        # campiona una realizzazione di rumore per questa valutazione.
         noise_a = np.random.normal(0, NOISE_STD_A)
         noise_b = np.random.normal(0, NOISE_STD_B)
         noise_c = np.random.normal(0, NOISE_STD_C)
@@ -104,10 +110,12 @@ def fitness_func(ga_instance, solution, solution_idx):
             """Aggiunge rumore ai coefficienti [a, b, c] del polinomio."""
             return [poly[0] + noise_a, poly[1] + noise_b, poly[2] + noise_c]
  
-        # ==================================================================
-        # SCENARIO 1 — Recupero su rettilineo con offset laterale
-        # Testa la capacità di tornare sulla linea da una posizione sfasata.
-        # ==================================================================
+        # ===========================================
+        # SCENARIO 1 — rettilineo con offset laterale
+        # -------------------------------------------
+        # testa la capacità di tornare sulla linea 
+        #           da una posizione sfasata.
+        # ===========================================
         straight_poly = [0.0, 0.0, 0.0]
         total_error += simulate_scenario(
             mpc,
@@ -116,10 +124,12 @@ def fitness_func(ga_instance, solution, solution_idx):
             noisy_poly=add_noise(straight_poly)
         )
  
-        # ==================================================================
-        # SCENARIO 2 — Inserimento in curva parabolica con offset e angolo
-        # Testa il tracking su una curva con condizioni iniziali non ideali.
-        # ==================================================================
+        # =================================================
+        # SCENARIO 2 — curva parabolica con offset e angolo
+        # -------------------------------------------------
+        #   Testa il tracking su una curva con condizioni 
+        #               iniziali non ideali.
+        # =================================================
         curve_poly = [0.05, 0.0, 0.0]
         total_error += simulate_scenario(
             mpc,
@@ -128,11 +138,13 @@ def fitness_func(ga_instance, solution, solution_idx):
             noisy_poly=add_noise(curve_poly)
         )
  
-        # ==================================================================
-        # SCENARIO 3 — Recupero con solo errore angolare
-        # Testa la capacità di correggere l'orientamento senza offset laterale.
-        # Questo scenario è quello che forza il GA a non trascurare w_psi.
-        # ==================================================================
+        # =========================================
+        # SCENARIO 3 — recupero con errore angolare
+        # -----------------------------------------
+        #   Testa la capacità di correggere 
+        # l'orientamento senza offset laterale.
+        # forza il GA a non trascurare w_psi.
+        # =========================================
         total_error += simulate_scenario(
             mpc,
             initial_state=np.array([0.0, 0.0, 0.4]),
@@ -140,11 +152,9 @@ def fitness_func(ga_instance, solution, solution_idx):
             noisy_poly=add_noise(straight_poly)
         )
  
-        # ==================================================================
-        # SCENARIO 4 — Curva stretta (a=0.15): stress test per le curve
-        # Senza questo scenario il GA non vede mai curve strette e trova
-        # pesi che vanno bene solo sui rettilinei.
-        # ==================================================================
+        # ===================================
+        # SCENARIO 4 — Curva stretta (a=0.15)
+        # ===================================
         tight_curve_poly = [0.15, 0.0, 0.0]
         total_error += simulate_scenario(
             mpc,
@@ -153,9 +163,10 @@ def fitness_func(ga_instance, solution, solution_idx):
             noisy_poly=add_noise(tight_curve_poly)
         )
  
-    # Errore medio su tutti i sample e tutti gli scenari
+    # errore medio su tutti i sample e tutti gli scenari
     mean_error = total_error / N_NOISE_SAMPLES
  
+    # per evitare casi di divisioni instabili
     if math.isnan(mean_error) or mean_error > 1000:
         return 0.0001
  
@@ -163,7 +174,7 @@ def fitness_func(ga_instance, solution, solution_idx):
  
  
 # =============================================================
-# Rilevamento stagnazione e iniezione di diversità
+# rilevamento stagnazione e iniezione di diversità
 # =============================================================
 _stagnation_counter = 0
 _last_best_fitness  = 0.0
@@ -174,12 +185,12 @@ def on_generation(ga_instance):
     gen = ga_instance.generations_completed
     best_solution, best_fitness, _ = ga_instance.best_solution()
  
-    pop      = ga_instance.population
+    pop = ga_instance.population
     std_devs = [float(round(np.std(pop[:, g]), 4)) for g in range(4)]
     formatted_weights = [float(round(x, 3)) for x in best_solution]
     print(f"[Gen {gen}] Fitness: {best_fitness:.4f} | Pesi: {formatted_weights} | StdDev: {std_devs}")
  
-    # Dopo un tot di generazioni senza miglioramento, inietta individui casuali
+    # dopo un tot di generazioni senza miglioramento, inietta individui casuali
     # per rompere la convergenza prematura mantenendo i 2 migliori (keep_elitism).
     if abs(best_fitness - _last_best_fitness) < 1e-4:
         _stagnation_counter += 1
@@ -222,8 +233,11 @@ ga_instance = pygad.GA(
 )
  
 if __name__ == '__main__':
-    print("Avvio GA — 4 scenari, latenza simulata, rumore percezione...")
+    print("Avvio GA — 4 scenari")
     print(f"  CMD_DELAY={CMD_DELAY} step | N_NOISE_SAMPLES={N_NOISE_SAMPLES} | TRAINING_STEPS={TRAINING_STEPS}")
+
+    np.random.seed(RANDOM_SEED)
+
     ga_instance.run()
  
     solution, solution_fitness, _ = ga_instance.best_solution()
@@ -231,3 +245,18 @@ if __name__ == '__main__':
     print(f"Fitness finale: {solution_fitness:.4f}")
     print(f"Pesi ottimali [w_d, w_psi, w_effort, w_v]:")
     print([float(round(x, 3)) for x in solution])
+    
+    model_weights_filename = "GeneticAlgorithmWeights"
+    ga_instance.save(model_weights_filename)
+    run_metadata = {
+        "seed": RANDOM_SEED,
+        "solution": [float(round(x, 3)) for x in solution],
+        "solution_fitness": float(solution_fitness),
+        "num_generations_completed": ga_instance.generations_completed,
+        "cmd_delay": CMD_DELAY,
+        "n_noise_samples": N_NOISE_SAMPLES,
+        "training_steps": TRAINING_STEPS,
+    }
+    with open("ga_checkpoint_meta.json", "w") as f:
+        json.dump(run_metadata, f, indent=2)
+    print(f"saving the model parameters in {model_weights_filename} and ga_checkpoint_meta.json")
