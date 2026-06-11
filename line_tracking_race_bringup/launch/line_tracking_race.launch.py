@@ -5,7 +5,8 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
-    RegisterEventHandler
+    RegisterEventHandler,
+    TimerAction
 )
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -83,8 +84,23 @@ def generate_ros2_control_description(context, *args, **kwargs):
     return [ld]
     
 def generate_launch_description():
-
     # Declare launch arguments
+    
+    # ======== AGGIUNTE PERSONALI ============
+    mode_arg = DeclareLaunchArgument(
+        'mode',
+        default_value='run',
+        description='Modalità nodo: run | train'
+    )
+
+    weights_arg = DeclareLaunchArgument(
+        'weights',
+        default_value='[7.895, 2.486, 0.053, 0.028]',
+        description='Pesi MPC [w_d, w_psi, w_effort, w_v]'
+    )
+    # ========================================
+
+    
     world_file_arg = DeclareLaunchArgument(
         'world_file',
         default_value='race_track.world',
@@ -218,6 +234,19 @@ def generate_launch_description():
        condition=IfCondition(LaunchConfiguration('rviz'))
     )
 
+    # ================= NODI CUSTOM =================
+    tracker_node = Node(
+        package='line_tracking_race_application',
+        executable='GeneticLineTracker',
+        name='genetic_line_tracker',
+        parameters=[{
+            'use_sim_time': True,
+            'mode':    LaunchConfiguration('mode'),
+            'weights': LaunchConfiguration('weights'),
+        }],
+        output='screen',
+    )
+    # ===============================================
     return LaunchDescription(
         [
             world_file_arg,
@@ -229,6 +258,8 @@ def generate_launch_description():
             use_ros2_control_arg,
             car_ros2_control_file_arg,
             rviz_arg,
+            mode_arg, # CUSTOM
+            weights_arg, # CUSTOM
             # gz_sim_ros_bridge,
             # gz_gui_cmd,
             gz_sim,
@@ -236,6 +267,7 @@ def generate_launch_description():
             robot_state_publisher,
             spawn_robot_node,
             ros2_control,
-            rviz
+            rviz,
+            tracker_node # CUSTOM
         ]
     )
