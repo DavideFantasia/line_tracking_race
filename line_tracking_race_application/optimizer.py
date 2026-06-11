@@ -1,262 +1,214 @@
-import pygad
-import numpy as np
-import math
-from model import Model
+"""
+optimizer.py
+============
+Algoritmo Genetico per il tuning dei pesi MPC.
+
+Uso
+---
+# Training offline (default, nessun Gazebo necessario):
+    python3 optimizer.py
+
+# Training online su Gazebo (richiede Gazebo + nodo ROS in modalità TRAIN):
+    python3 optimizer.py --strategy online
+
+# Riprendi da un checkpoint:
+    python3 optimizer.py --resume GeneticAlgorithmWeights
+
+Opzioni
+-------
+--strategy  offline | online        (default: offline)
+--resume    <percorso .pkl>         carica checkpoint PyGAD e continua
+--seed      <int>                   seed NumPy per riproducibilità (default: 42)
+--output    <nome file senza ext>   nome base per .pkl e .json (default: GeneticAlgorithmWeights)
+"""
+
+import argparse
 import json
+import sys
 
-RANDOM_SEED = 42
+import numpy as np
+import pygad
 
-# deviazioni standard del rumore che simula l'incertezza della camera.
-#   - coefficiente quadratico   (a): rumore piccolo, raramente sbaglia molto
-#   - coefficiente lineare      (b): rumore medio, dipende dall'angolo di vista
-#   - termine noto              (c): rumore più alto, offset laterale più incerto
-NOISE_STD_A = 0.005
-NOISE_STD_B = 0.02
-NOISE_STD_C = 0.05
- 
-# ogni individuo viene valutato N_NOISE_SAMPLES volte con rumore diverso
-# e si usa la media degli errori come fitness. Questo forza il GA a trovare
-# pesi ROBUSTI invece di pesi ottimali solo in condizioni ideali.
-# valore alto => migliora la robustezza | moltiplica il tempo di training.
-N_NOISE_SAMPLES = 3
- 
-# simula la latenza ROS (topic /cmd_vel, scheduling del timer).
-# Con dt=0.05s e CMD_DELAY=2, il robot esegue il comando calcolato 100ms prima.
-CMD_DELAY = 2
- 
-TRAINING_STEPS = 25  # step per scenario — 25*0.05s = 1.25s di simulazione
+from fitness_strategy import FitnessStrategy, OfflineFitnessStrategy, OnlineGazeboFitnessStrategy
 
-# parametri per simulare e penalizzare l'uscita dal terreno
-TRACK_HALF_WIDTH = 1.0
-SOFT_MARGIN = 0.7       # inizia a penalizzare già oltre questo valore
-OUT_PENALTY = 2.0
- 
-def simulate_scenario(mpc, initial_state, target_poly, noisy_poly):
+class _FitnessWrapper:
     """
-    Simula uno scenario con buffer di latenza e percezione rumorosa.
- 
-    Il robot calcola i comandi usando 'noisy_poly' (quello che "vede" dalla camera),
-    ma si muove seguendo la cinematica reale. L'errore viene misurato rispetto
-    a 'target_poly' (la linea reale, senza rumore).
- 
-    Ritorna l'errore totale accumulato (y_err + psi_err) sullo scenario.
+    Wrapper picklable attorno a una FitnessStrategy.
+    Definita a top-level così multiprocessing può serializzarla su Windows
+    (spawn) oltre che su Linux (fork).
     """
-    state = initial_state.copy()
-    
-    # FIFO queue per la latenza dei comandi: i primi CMD_DELAY step
-    # il robot sta fermo (comandi zero), poi inizia ad eseguire con ritardo.
-    cmd_buffer = [(0.0, 0.0)] * CMD_DELAY
+    def __init__(self, strategy: FitnessStrategy):
+        self.strategy = strategy
  
-    scenario_error = 0.0
-    target_poly_der = np.polyder(target_poly)  # derivata precalcolata della linea REALE
- 
-    for step in range(TRAINING_STEPS):
-        # il robot "vede" la linea con rumore e calcola il comando
-        v_cmd, w_cmd = mpc.solve(state, target_line=noisy_poly)
-        
-        # aggiunge il comando al buffer e preleva quello in ritardo
-        cmd_buffer.append((v_cmd, w_cmd))
-        v_applied, w_applied = cmd_buffer.pop(0)  # esegue il comando di CMD_DELAY step fa
- 
-        # kinematica con il comando ritardato
-        state[0] += mpc.dt * math.cos(state[2]) * v_applied
-        state[1] += mpc.dt * math.sin(state[2]) * v_applied
-        state[2] += mpc.dt * w_applied
- 
-        # errore misurato sulla linea non rumorosa
-        y_target    = np.polyval(target_poly, state[0])
-        dy_dx       = np.polyval(target_poly_der, state[0])
-        theta_target = math.atan2(dy_dx, 1.0)
- 
-        y_err   = abs(state[1] - y_target)
-        psi_err = abs((state[2] - theta_target + math.pi) % (2 * math.pi) - math.pi)
-        
-        # penalita progressiva dalla soft margin in poi
-        lateral_excess = max(0.0, abs(state[1]) - SOFT_MARGIN)
+    def __call__(self, ga_instance, solution, solution_idx):
+        return self.strategy.evaluate(solution.tolist())
 
-        scenario_error += y_err + psi_err + 5.0 * lateral_excess
-
-        # terminazione anticipata oltre il bordo fisico
-        if abs(state[1]) > TRACK_HALF_WIDTH:
-            #errore proporzionale a quanto in fretta si butta di sotto
-            remaining = TRAINING_STEPS - step - 1
-            scenario_error += OUT_PENALTY * remaining
-            break
- 
-    return scenario_error
- 
- 
-def fitness_func(ga_instance, solution, solution_idx):
-    """
-    Funzione di fitness. 'solution' è l'array dei 4 pesi [w_d, w_psi, w_effort, w_v].
- 
-    Ogni individuo viene valutato su 4 scenari per N_NOISE_SAMPLES realizzazioni di rumore.
-    La fitness è l'inverso dell'errore medio
-    l'errore medio valutato su tutti gli scenari e su tutte le realizzazioni di rumore.
-    """
-    mpc = Model()
-    mpc.set_weights(solution)
- 
-    total_error = 0.0
- 
-    for _ in range(N_NOISE_SAMPLES):
-        
-        # campiona una realizzazione di rumore per questa valutazione.
-        noise_a = np.random.normal(0, NOISE_STD_A)
-        noise_b = np.random.normal(0, NOISE_STD_B)
-        noise_c = np.random.normal(0, NOISE_STD_C)
- 
-        def add_noise(poly):
-            """Aggiunge rumore ai coefficienti [a, b, c] del polinomio."""
-            return [poly[0] + noise_a, poly[1] + noise_b, poly[2] + noise_c]
- 
-        # ===========================================
-        # SCENARIO 1 — rettilineo con offset laterale
-        # -------------------------------------------
-        # testa la capacità di tornare sulla linea 
-        #           da una posizione sfasata.
-        # ===========================================
-        straight_poly = [0.0, 0.0, 0.0]
-        total_error += simulate_scenario(
-            mpc,
-            initial_state=np.array([0.0, 0.5, 0.0]),
-            target_poly=straight_poly,
-            noisy_poly=add_noise(straight_poly)
-        )
- 
-        # =================================================
-        # SCENARIO 2 — curva parabolica con offset e angolo
-        # -------------------------------------------------
-        #   Testa il tracking su una curva con condizioni 
-        #               iniziali non ideali.
-        # =================================================
-        curve_poly = [0.05, 0.0, 0.0]
-        total_error += simulate_scenario(
-            mpc,
-            initial_state=np.array([0.0, 0.3, 0.2]),
-            target_poly=curve_poly,
-            noisy_poly=add_noise(curve_poly)
-        )
- 
-        # =========================================
-        # SCENARIO 3 — recupero con errore angolare
-        # -----------------------------------------
-        #   Testa la capacità di correggere 
-        # l'orientamento senza offset laterale.
-        # forza il GA a non trascurare w_psi.
-        # =========================================
-        total_error += simulate_scenario(
-            mpc,
-            initial_state=np.array([0.0, 0.0, 0.4]),
-            target_poly=straight_poly,
-            noisy_poly=add_noise(straight_poly)
-        )
- 
-        # ===================================
-        # SCENARIO 4 — Curva stretta (a=0.15)
-        # ===================================
-        tight_curve_poly = [0.15, 0.0, 0.0]
-        total_error += simulate_scenario(
-            mpc,
-            initial_state=np.array([0.0, 0.2, 0.1]),
-            target_poly=tight_curve_poly,
-            noisy_poly=add_noise(tight_curve_poly)
-        )
- 
-    # errore medio su tutti i sample e tutti gli scenari
-    mean_error = total_error / N_NOISE_SAMPLES
- 
-    # per evitare casi di divisioni instabili
-    if math.isnan(mean_error) or mean_error > 1000:
-        return 0.0001
- 
-    return 1.0 / (mean_error + 0.001)
- 
- 
-# =============================================================
-# rilevamento stagnazione e iniezione di diversità
-# =============================================================
-_stagnation_counter = 0
-_last_best_fitness  = 0.0
- 
-def on_generation(ga_instance):
-    global _stagnation_counter, _last_best_fitness
- 
-    gen = ga_instance.generations_completed
-    best_solution, best_fitness, _ = ga_instance.best_solution()
- 
-    pop = ga_instance.population
-    std_devs = [float(round(np.std(pop[:, g]), 4)) for g in range(4)]
-    formatted_weights = [float(round(x, 3)) for x in best_solution]
-    print(f"[Gen {gen}] Fitness: {best_fitness:.4f} | Pesi: {formatted_weights} | StdDev: {std_devs}")
- 
-    # dopo un tot di generazioni senza miglioramento, inietta individui casuali
-    # per rompere la convergenza prematura mantenendo i 2 migliori (keep_elitism).
-    if abs(best_fitness - _last_best_fitness) < 1e-4:
-        _stagnation_counter += 1
-    else:
-        _stagnation_counter = 0
-    _last_best_fitness = best_fitness
- 
-    if _stagnation_counter >= 6:
-        n_replace = 3  # rimpiazza 3 individui, partendo dai peggiori
-        for i in range(1, n_replace + 1):
-            for g, space in enumerate(gene_space):
-                pop[-i, g] = np.random.uniform(space['low'], space['high'])
-        _stagnation_counter = 0
-        print(f"  --> Iniezione diversità attivata (stagnazione rilevata)")
- 
- 
-# =============================================================
-# Setup GA
-# =============================================================
-gene_space = [
-    {'low': 0.5, 'high': 8.0},  # w_d
-    {'low': 1.0, 'high': 8.0},  # w_psi — floor a 1.0 per evitare ratio w_d/w_psi >> 1
-    {'low': 0.0, 'high': 0.5},  # w_effort
-    {'low': 0.0, 'high': 2.0},  # w_v
+# Configurazione GA — indipendente dalla strategia
+GENE_SPACE = [
+    {"low": 0.5,  "high": 8.0},   # w_d     —   errore posizione laterale
+    {"low": 1.0,  "high": 8.0},   # w_psi   —   errore orientamento (floor a 1.0)
+    {"low": 0.01, "high": 0.5},   # w_effort—   penalità sterzata
+    {"low": 0.01, "high": 2.0},   # w_v     —   penalità velocità
 ]
- 
-ga_instance = pygad.GA(
-    num_generations=50,
-    keep_elitism=2,
-    num_parents_mating=4,
-    fitness_func=fitness_func,
-    sol_per_pop=20,
-    num_genes=4,
-    gene_space=gene_space,
-    crossover_type="uniform",
-    mutation_type="adaptive",
-    mutation_num_genes=(2, 1),
-    on_generation=on_generation,
-    parallel_processing=["process", 8],
+
+GA_PARAMS = dict(
+    num_generations     = 50,
+    keep_elitism        = 2,
+    num_parents_mating  = 4,
+    sol_per_pop         = 20,
+    num_genes           = 4,
+    gene_space          = GENE_SPACE,
+    crossover_type      = "uniform",
+    mutation_type       = "adaptive",
+    mutation_num_genes  = (2, 1),
+    # parallel_processing viene aggiunto solo per la strategia offline
+    # perché OnlineGazebo non è parallelizzabile (un solo Gazebo per processo)
 )
- 
-if __name__ == '__main__':
-    print("Avvio GA — 4 scenari")
-    print(f"  CMD_DELAY={CMD_DELAY} step | N_NOISE_SAMPLES={N_NOISE_SAMPLES} | TRAINING_STEPS={TRAINING_STEPS}")
 
-    np.random.seed(RANDOM_SEED)
 
-    ga_instance.run()
- 
-    solution, solution_fitness, _ = ga_instance.best_solution()
-    print(f"\n== ALLENAMENTO COMPLETATO ==")
-    print(f"Fitness finale: {solution_fitness:.4f}")
-    print(f"Pesi ottimali [w_d, w_psi, w_effort, w_v]:")
-    print([float(round(x, 3)) for x in solution])
-    
-    model_weights_filename = "GeneticAlgorithmWeights"
-    ga_instance.save(model_weights_filename)
-    run_metadata = {
-        "seed": RANDOM_SEED,
-        "solution": [float(round(x, 3)) for x in solution],
-        "solution_fitness": float(solution_fitness),
-        "num_generations_completed": ga_instance.generations_completed,
-        "cmd_delay": CMD_DELAY,
-        "n_noise_samples": N_NOISE_SAMPLES,
-        "training_steps": TRAINING_STEPS,
+# Stato stagnazione — condiviso tra generazioni via closure
+class _StagnationGuard:
+    """Rileva stagnazione e inietta diversità nella popolazione."""
+
+    def __init__(self, patience: int = 6, n_inject: int = 3):
+        self.patience   = patience
+        self.n_inject   = n_inject
+        self._counter   = 0
+        self._last_best = 0.0
+
+    def __call__(self, ga_instance):
+        gen = ga_instance.generations_completed
+        best_sol, best_fit, _ = ga_instance.best_solution()
+
+        pop      = ga_instance.population
+        std_devs = [round(float(np.std(pop[:, g])), 4) for g in range(4)]
+        weights  = [round(float(x), 3) for x in best_sol]
+
+        print(f"[Gen {gen:3d}] Fitness: {best_fit:.4f} | Pesi: {weights} | StdDev: {std_devs}")
+
+        if abs(best_fit - self._last_best) < 1e-4:
+            self._counter += 1
+        else:
+            self._counter = 0
+        self._last_best = best_fit
+
+        if self._counter >= self.patience:
+            # Rimpiazza i peggiori individui (lascia intatti i keep_elitism migliori)
+            for i in range(1, self.n_inject + 1):
+                for g, space in enumerate(GENE_SPACE):
+                    pop[-i, g] = np.random.uniform(space["low"], space["high"])
+            self._counter = 0
+            print(f"  --> [Stagnazione] Iniezione diversità")
+
+
+# Builder del GA
+def build_ga(strategy: FitnessStrategy) -> pygad.GA:
+    """
+    Costruisce l'istanza PyGAD configurata per la strategia scelta.
+    La OnlineGazebo disabilita il parallel_processing perché un solo
+    Gazebo non può valutare più individui contemporaneamente.
+    """
+    stagnation = _StagnationGuard(patience=6, n_inject=3)
+
+    fitness_wrapper = _FitnessWrapper(strategy)
+
+    params = dict(GA_PARAMS)  # copia per non mutare il dict globale
+    params["fitness_func"]    = fitness_wrapper
+    params["on_generation"]   = stagnation
+
+    if isinstance(strategy, OfflineFitnessStrategy):
+        params["parallel_processing"] = ["process", 6]
+    # OnlineGazebo: nessun parallel_processing — il GA gira sequenzialmente
+
+    return pygad.GA(**params)
+
+
+# Salvataggio checkpoint
+def save_checkpoint(ga: pygad.GA, strategy: FitnessStrategy, output_name: str, seed: int):
+    ga.save(output_name)
+
+    solution, fitness, _ = ga.best_solution()
+    metadata = {
+        "strategy":                 strategy.name,
+        "seed":                     seed,
+        "solution":                 [round(float(x), 3) for x in solution],
+        "solution_fitness":         float(fitness),
+        "num_generations_completed": ga.generations_completed,
     }
-    with open("ga_checkpoint_meta.json", "w") as f:
-        json.dump(run_metadata, f, indent=2)
-    print(f"saving the model parameters in {model_weights_filename} and ga_checkpoint_meta.json")
+    # parametri specifici della strategia offline per riproducibilità
+    if isinstance(strategy, OfflineFitnessStrategy):
+        metadata.update({
+            "cmd_delay":        strategy.cmd_delay,
+            "n_noise_samples":  strategy.n_noise_samples,
+            "training_steps":   strategy.training_steps,
+        })
+    elif isinstance(strategy, OnlineGazeboFitnessStrategy):
+        metadata.update({
+            "eval_duration": strategy.eval_duration,
+        })
+
+    meta_path = output_name + "_meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\nCheckpoint salvato: {output_name}.pkl + {meta_path}")
+    return metadata
+
+
+# Entry point
+def main():
+    parser = argparse.ArgumentParser(description="GA optimizer per pesi MPC")
+    parser.add_argument(
+        "--strategy", choices=["offline", "online"], default="offline",
+        help="offline = simulatore analitico | online = Gazebo reale (default: offline)"
+    )
+    parser.add_argument(
+        "--resume", metavar="CHECKPOINT",
+        help="Percorso al file .pkl PyGAD da cui riprendere il training"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Seed NumPy per riproducibilità (default: 42)"
+    )
+    parser.add_argument(
+        "--output", default="GeneticAlgorithmWeights",
+        help="Nome base per i file di output .pkl e _meta.json"
+    )
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+
+    # Costruisci la strategia scelta
+    if args.strategy == "offline":
+        strategy = OfflineFitnessStrategy()
+    else:
+        strategy = OnlineGazeboFitnessStrategy()
+
+    print(f"Strategia: {strategy.name}")
+    print(f"Seed: {args.seed} | Output: {args.output}")
+
+    # Carica da checkpoint o costruisci da zero
+    if args.resume:
+        print(f"Ripresa da checkpoint: {args.resume}")
+        ga = pygad.load(args.resume)
+        
+        ga.fitness_func   = _FitnessWrapper(strategy)
+        ga.on_generation  = _StagnationGuard(patience=6, n_inject=3)
+    else:
+        ga = build_ga(strategy)
+
+    # Training
+    print(f"\nAvvio GA — strategia '{strategy.name}'")
+    ga.run()
+
+    solution, fitness, _ = ga.best_solution()
+    print(f"\n== ALLENAMENTO COMPLETATO ==")
+    print(f"Fitness finale:  {fitness:.4f}")
+    print(f"Pesi ottimali [w_d, w_psi, w_effort, w_v]:")
+    print([round(float(x), 3) for x in solution])
+
+    save_checkpoint(ga, strategy, args.output, args.seed)
+
+
+if __name__ == "__main__":
+    main()

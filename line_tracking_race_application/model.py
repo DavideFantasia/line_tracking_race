@@ -3,20 +3,19 @@ from scipy.optimize import minimize
 import math
 
 class Model:
-    def __init__(self, dt=0.05, horizon=10):
+    def __init__(self, dt=0.05, horizon=5):
         self.dt = dt # Ts, Time di Sampling
-        self.horizon = horizon # N passi di previsione nel futuro
+        self.horizon = horizon  # N passi di previsione nel futuro
         # pesi da ottimizzare tramite Genetica
         self.weight_d = 2.0     # peso errore distanza dalla linea
         self.weight_psi = 1.5   # peso errore orientamento
-        self.weight_effort = 0.0# penalità per sterzate sgravate
+        self.weight_effort = 0.01# penalità per sterzate sgravate
 
         self.weight_v = 1.0     # penalità se il robot non va alla velocità desiderata
-        self.v_target = 0.5     # velocità di crociera desiderata (m/s)
-
+        #self.v_target = 0.5    # velocità di crociera desiderata (m/s)
         # limiti fisici del veicolo (da car_gazebo_control.xacro)
-        self.v_max = 0.5   # m/s
-        self.w_max = 1.0   # rad/s
+        self.v_max = 2.0        # m/s
+        self.w_max = 1.0        # rad/s
 
         self._last_solution = None
         
@@ -30,10 +29,9 @@ class Model:
         simula 'horizon' passi nel futuro con Forward Euler e calcola il costo.
  
         Parametri:
-        controls        : array [v0, w0, v1, w1, ..., vN, wN]
-        current_state   : [x, y, theta] — stato attuale nel frame robot
-        target_line     : coefficienti polinomio [a, b, c] per y = ax² + bx + c
-        target_line_der : derivata precalcolata di target_line (evita ricalcolo nel loop)
+            controls        : array [v0, w0, v1, w1, ..., vN, wN]
+            current_state   : [x, y, theta] — stato attuale nel frame robot
+            target_line     : coefficienti polinomio [a, b, c] per y = ax^2 + bx + c
         """
         cost = 0.0
         
@@ -70,7 +68,8 @@ class Model:
             cost += self.weight_d * (d   ** 2)
             cost += self.weight_psi * (psi ** 2)
             cost += self.weight_effort * (w   ** 2)
-            cost += self.weight_v * ((v - self.v_target) ** 2)
+            #cost += self.weight_v * ((v - self.v_target) ** 2)
+            cost += self.weight_v * ((self.v_max - v) ** 2) #per spingere la velocita' verso la velocita' massima
             
         return cost
 
@@ -84,9 +83,10 @@ class Model:
             # l'ultimo passo ripete l'ultimo comando (assunzione stazionaria)
             controls0[-2] = self._last_solution[-2]
             controls0[-1] = self._last_solution[-1]
-        else:
+        else: # cold start
             controls0 = np.zeros(self.horizon * 2)
-            controls0[0::2] = self.v_target
+            #controls0[0::2] = self.v_target
+            controls0[0::2] = self.v_max
  
         bounds = []
         for _ in range(self.horizon):
@@ -94,13 +94,17 @@ class Model:
             bounds.append((-self.w_max,  self.w_max))   # w in [-w_max, w_max]
  
         res = minimize(
-            self.cost_function,
-            controls0,
-            args=(current_state, target_line),
-            method='SLSQP',
-            bounds=bounds,
-            options={'maxiter': 100, 'ftol': 1e-5}
-        )
+                self.cost_function,
+                controls0,
+                args=(current_state, target_line),
+                method='SLSQP',
+                bounds=bounds,
+                options={
+                    'maxiter': 10,
+                    'ftol': 1e-5,
+                    'disp': False,
+                }
+            )
  
         self._last_solution = res.x  # salva per il warm-start al prossimo step
  
