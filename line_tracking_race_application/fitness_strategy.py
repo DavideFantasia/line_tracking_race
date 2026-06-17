@@ -141,7 +141,15 @@ class OfflineFitnessStrategy(FitnessStrategy):
         target_poly_der = np.polyder(target_poly)
 
         for step in range(self.training_steps):
-            v_cmd, w_cmd = mpc.solve(state, target_line=noisy_poly)
+            y_noisy     = np.polyval(noisy_poly, state[0])
+            dy_dx_noisy = np.polyval(np.polyder(noisy_poly), state[0])
+            theta_noisy = math.atan2(dy_dx_noisy, 1.0)
+            
+            d_noisy     = state[1] - y_noisy
+            psi_noisy   = (state[2] - theta_noisy + math.pi) % (2*math.pi) - math.pi
+            gamma_noisy = (2 * noisy_poly[0]) / math.pow(1 + dy_dx_noisy**2, 1.5)
+
+            v_cmd, w_cmd = mpc.solve(np.array([0.0, d_noisy, psi_noisy]), gamma_noisy)
 
             cmd_buffer.append((v_cmd, w_cmd))
             v_applied, w_applied = cmd_buffer.pop(0)
@@ -151,6 +159,7 @@ class OfflineFitnessStrategy(FitnessStrategy):
             state[1] += mpc.dt * math.sin(state[2]) * v_applied
             state[2] += mpc.dt * w_applied
 
+            # ==== ERRORE SENZA RUMORE PER LA FITNESS ====
             y_target     = np.polyval(target_poly, state[0])
             dy_dx        = np.polyval(target_poly_der, state[0])
             theta_target = math.atan2(dy_dx, 1.0)
@@ -189,7 +198,7 @@ class OnlineGazeboFitnessStrategy(FitnessStrategy):
     │  2. attende /mpc_score  ◄──────────────────────────────────────      │
     │     1 / (mean_error + 0.001)      pubblica fitness                   │
     │                                                                      │
-
+    |                                                                      |
     │  3. ritorna fitness al GA                                            │
     └──────────────────────────────────────────────────────────────────────┘
     _______________________________________________________________________________
@@ -212,7 +221,7 @@ class OnlineGazeboFitnessStrategy(FitnessStrategy):
         self.weights_topic  = weights_topic
         self.score_topic    = score_topic
 
-        # ROS 2 viene inizializzato lazy al primo evaluate()
+        # ROS2 viene inizializzato lazy al primo evaluate()
         self._ros_ready   = False
         self._node        = None
         self._pub_weights = None

@@ -43,12 +43,12 @@ class _FitnessWrapper:
     def __call__(self, ga_instance, solution, solution_idx):
         return self.strategy.evaluate(solution.tolist())
 
-# Configurazione GA — indipendente dalla strategia
+# Configurazione GA: indipendente dalla strategia
 GENE_SPACE = [
-    {"low": 0.5,  "high": 8.0},   # w_d     —   errore posizione laterale
-    {"low": 1.0,  "high": 8.0},   # w_psi   —   errore orientamento (floor a 1.0)
-    {"low": 0.01, "high": 0.5},   # w_effort—   penalità sterzata
-    {"low": 0.01, "high": 2.0},   # w_v     —   penalità velocità
+    {"low": 0.5,  "high": 8.0},   # w_d         errore posizione laterale
+    {"low": 1.0,  "high": 8.0},   # w_psi       errore orientamento (floor a 1.0)
+    {"low": 0.01, "high": 0.5},   # w_effort    penalità sterzata
+    {"low": 0.01, "high": 2.0},   # w_v         penalità velocità
 ]
 
 GA_PARAMS = dict(
@@ -66,7 +66,7 @@ GA_PARAMS = dict(
 )
 
 
-# Stato stagnazione — condiviso tra generazioni via closure
+# Stato stagnazione: condiviso tra generazioni via closure
 class _StagnationGuard:
     """Rileva stagnazione e inietta diversità nella popolazione."""
 
@@ -118,7 +118,7 @@ def build_ga(strategy: FitnessStrategy) -> pygad.GA:
 
     if isinstance(strategy, OfflineFitnessStrategy):
         params["parallel_processing"] = ["process", 6]
-    # OnlineGazebo: nessun parallel_processing — il GA gira sequenzialmente
+    # OnlineGazebo: nessun parallel_processing : il GA gira sequenzialmente
 
     return pygad.GA(**params)
 
