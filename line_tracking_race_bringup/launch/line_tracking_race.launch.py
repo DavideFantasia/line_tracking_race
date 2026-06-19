@@ -5,7 +5,8 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
-    RegisterEventHandler
+    RegisterEventHandler,
+    ExecuteProcess
 )
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -13,7 +14,8 @@ from launch.conditions import IfCondition
 from launch.substitutions import (
     LaunchConfiguration,
     PathJoinSubstitution, 
-    Command
+    Command,
+    PythonExpression
 )
 
 from launch_ros.parameter_descriptions import ParameterValue
@@ -160,15 +162,16 @@ def generate_launch_description():
     world_file = PathJoinSubstitution([pkg_project_gazebo, 'worlds', LaunchConfiguration("world_file")])
 
     gz_sim = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py'])
-        ),
-        launch_arguments={
-            # -v -> verbose
-            # -r -> start simulation (required by ros2_control) 
-            'gz_args': [world_file, " -v 4"],
-            'on_exit_shutdown': 'True'
-        }.items(),
+    PythonLaunchDescriptionSource(
+        PathJoinSubstitution([pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py'])
+    ),
+    launch_arguments={
+        # -s -> server only (headless mode, NO GUI)
+        # -v -> verbose
+        # -r -> start simulation (required by ros2_control)
+        'gz_args': [world_file, " -s -r -v 1"],
+        'on_exit_shutdown': 'True'
+    }.items(),
     )
 
     # Launch bridge separately, avoiding ros_gz_bridge.launch,
@@ -218,6 +221,55 @@ def generate_launch_description():
        condition=IfCondition(LaunchConfiguration('rviz'))
     )
 
+    # ========================= ARGOMENTI CUSTOM =====================
+    mode_arg = DeclareLaunchArgument(
+        'mode', default_value='run', 
+        description='Modalita del tracker: run o train'
+    )
+    
+    weights_arg = DeclareLaunchArgument(
+        #'weights', default_value= '[6.556, 4.466, 0.447, 4.637, 1.442, 2.156, 1.396, 1.579]',#online training
+        #'weights', default_value= '[7.392, 6.926, 0.446, 4.562, 0.28, 0.763, 1.245, 2.064]', #offline training 
+        'weights', default_value='[300.0, 300.0, 0.3, 2.0, 1.0, 1.0, 1.0, 1.5]', 
+        description='Pesi MPC [w_d, w_psi, w_effort, k_curve, w_v, qf_mult_d, qf_mult_psi, gamma_decay_start]'
+    )
+
+    eval_duration_arg = DeclareLaunchArgument(
+        'eval_duration', default_value='20.0', # in secondi
+        description='Secondi per la valutazione del GA'
+    )
+
+    # ========================= NODO CUSTOM =========================
+    tracker_node = Node(
+        package='line_tracking_race_application',
+        executable='GeneticLineTracker.py',
+        name='genetic_line_tracker',
+        parameters=[{
+            'use_sim_time': True,
+            'mode': LaunchConfiguration('mode'),
+            'weights': LaunchConfiguration('weights'),
+            'eval_duration': LaunchConfiguration('eval_duration'),
+
+            'reset_x': LaunchConfiguration('x_pos'),
+            'reset_y': LaunchConfiguration('y_pos'),
+            'reset_yaw': LaunchConfiguration('yaw'),
+        }],
+        output='screen'
+    )
+
+    optimizer_process = ExecuteProcess(
+        cmd=[
+            'ros2', 'run', 'line_tracking_race_application', 'optimizer.py',
+            '--strategy', 'online',
+            '--eval_duration', LaunchConfiguration('eval_duration')
+        ],
+        output='screen',
+        # SOLO SE mode == 'train'
+        condition=IfCondition(
+            PythonExpression(["'", LaunchConfiguration('mode'), "' == 'train'"])
+        )
+    )
+
     return LaunchDescription(
         [
             world_file_arg,
@@ -231,11 +283,16 @@ def generate_launch_description():
             rviz_arg,
             # gz_sim_ros_bridge,
             # gz_gui_cmd,
+            mode_arg,      # CUSTOM
+            weights_arg,   # CUSTOM
+            eval_duration_arg,#CUSTOM
             gz_sim,
             gz_bridge,
             robot_state_publisher,
             spawn_robot_node,
             ros2_control,
-            rviz
+            rviz,
+            tracker_node, # CUSTOM
+            optimizer_process#CUSTOM
         ]
     )
