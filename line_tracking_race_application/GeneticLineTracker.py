@@ -38,8 +38,8 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float64, Float64MultiArray
-from gazebo_msgs.srv import SetEntityState
-from gazebo_msgs.msg import EntityState
+#from gazebo_msgs.srv import SetEntityState
+#from gazebo_msgs.msg import EntityState
 from geometry_msgs.msg import Pose, Quaternion, Vector3
 
 from cv_bridge import CvBridge
@@ -48,6 +48,8 @@ import numpy as np
 
 from model import Model
 
+import os
+from ament_index_python.packages import get_package_share_directory
 
 # PARAMETRI PER IL MASKING DELLA CAMERA
 LOWER_YELLOW = [20, 50, 50]
@@ -62,8 +64,8 @@ class GeneticLineTracker(Node):
         self.should_visualize = True
 
         self.declare_parameter("mode",          "run")
-        #self.declare_parameter("weights",       [7.895, 2.486, 0.053, 0.028])
-        self.declare_parameter("weights",       [3.0, 3.0, 0.3, 1.0])
+        #                                  [w_d, w_psi, w_effort, k_curve, w_v, Qf_mult_d, Qf_mult_psi, gamma_decay_start]
+        self.declare_parameter("weights",       [3.0, 3.0, 0.3, 2.5, 1.0, 1.0, 1.0, 1.5])
         self.declare_parameter("eval_duration", 15.0)
         self.declare_parameter("weights_topic", "/mpc_weights")
         self.declare_parameter("score_topic",   "/mpc_score")
@@ -94,21 +96,27 @@ class GeneticLineTracker(Node):
         self.camera_info_msg = None
         self.prev_centroid = None
         self.current_state = np.zeros(3)
+        self.current_z = 0.45
 
         # Variabili di stato Frenet-Serret estratte dalla visione
         self.d = 0.0
         self.psi = 0.0
         self.gamma = 0.0
         self.traj_poly = np.zeros(3)
+        
+        # contatore di iterazioni senza vedere piu la linea
+        # per resettare in caso di fuori pista
+        self.lost_line_counter = 0
 
         # ultima soluzione valida
         self.last_valid_d = 0.0
         self.last_valid_psi = 0.0
         self.last_valid_gamma = 0.0
+        self.last_valid_traj_poly = np.zeros(3)
 
         # Modello MPC
-        self.mpc = Model(0.1, 20)
-        self.timer_update_frequency = 0.1   #ogni 0.1 secondi, come il framerate di aggiornamento della camera
+        self.mpc = Model()
+        self.timer_update_frequency = 1.0/10.0   #ogni tot secondi, come il framerate di aggiornamento della camera
 
         # Setup per modalità specifica
         if self._mode == "train":
@@ -138,7 +146,6 @@ class GeneticLineTracker(Node):
 
         self.weights_sub = self.create_subscription(Float64MultiArray, weights_topic, self._on_new_weights, 1)
         self.score_pub = self.create_publisher(Float64, score_topic, 1)
-        self._reset_client = self.create_client(SetEntityState, "/set_entity_state")
 
         self._eval_active       = False   
         self._eval_start_time   = None
@@ -153,6 +160,7 @@ class GeneticLineTracker(Node):
         self._first_odom_received = True
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
+        z = msg.pose.pose.position.z
         q = msg.pose.pose.orientation
 
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -160,6 +168,7 @@ class GeneticLineTracker(Node):
         theta = math.atan2(siny_cosp, cosy_cosp)
 
         self.current_state = np.array([x, y, theta])
+        self.current_z = z # utile in fase di training per vedere se precipitata
 
     def _camera_info_callback(self, msg):
         if self.camera_info_msg is None:
@@ -186,10 +195,8 @@ class GeneticLineTracker(Node):
             self.prev_centroid = centroid
         else:
             if self.prev_centroid is None:
-                self.get_logger().warn("No centroid found and no previous to reuse. Using center.")
                 centroid = (width // 2, height // 2)
             else:
-                self.get_logger().warn("No centroid found, reusing previous waypoint.")
                 centroid = self.prev_centroid
 
         # Conversion matrix
@@ -206,19 +213,26 @@ class GeneticLineTracker(Node):
         )
 
         if result is not None:
-            # Linea vista! Aggiorno i valori e la memoria
+            # Linea vista
             d, psi, gamma, traj_poly = result
             self.last_valid_d = d
             self.last_valid_psi = psi
             self.last_valid_gamma = gamma
             self.last_valid_traj_poly = traj_poly
+
+            # Se la vediamo, azzeriamo il contatore
+            if hasattr(self, 'lost_line_counter'):
+                self.lost_line_counter = 0
         else:
             # Linea persa di vista
-            self.get_logger().warn("Linea persa, uso di precedenti valori")
             d = self.last_valid_d
             psi = self.last_valid_psi
             gamma = self.last_valid_gamma
             self.traj_poly = self.last_valid_traj_poly
+
+            # Se siamo ciechi, incrementiamo il contatore
+            if hasattr(self, 'lost_line_counter'):
+                self.lost_line_counter += 1
 
         # Visualization part
         if self.should_visualize:
@@ -375,11 +389,7 @@ class GeneticLineTracker(Node):
         if not self._node_ready:
             return
         
-        err_msg = Vector3()
-        err_msg.x = float(self.d)      # Errore laterale
-        err_msg.y = float(self.psi)    # Errore angolare
-        err_msg.z = float(self.gamma)  # Curvatura
-        self.error_pub.publish(err_msg)
+        self._publish_error()
 
         v, w = self._solve_mpc()
         self._publish_cmd(v, w)
@@ -392,7 +402,7 @@ class GeneticLineTracker(Node):
         Carica i pesi, resetta Gazebo e avvia una nuova valutazione.
         """
         weights = list(msg.data)
-        self.get_logger().info(f"[TRAIN] Nuovi pesi ricevuti: {[round(w, 3) for w in weights]}")
+        self.get_logger().info(f"[TRAIN] Nuovi pesi ricevuti:\n\t{[round(w, 3) for w in weights]}")
 
         self.mpc.set_weights(weights)
 
@@ -405,45 +415,94 @@ class GeneticLineTracker(Node):
         self._eval_active       = True
 
     def _reset_gazebo_pose(self):
-        """
-        Resetta la posizione del robot in Gazebo via SetEntityState.
-        Gestisce il caso in cui il servizio non sia disponibile senza bloccare.
-        """
-        if not self._reset_client.service_is_ready():
-            self.get_logger().info("[TRAIN] /set_entity_state non disponibile — reset saltato")
-            return
+        import subprocess
+        import time
 
         rx, ry, ryaw = self._reset_pose
 
-        # Conversione yaw -> quaternion
-        q = Quaternion()
-        q.x = 0.0
-        q.y = 0.0
-        q.z = math.sin(ryaw / 2.0)
-        q.w = math.cos(ryaw / 2.0)
-
-        pose = Pose()
-        pose.position.x = rx
-        pose.position.y = ry
-        pose.position.z = 0.45
-        pose.orientation= q
-
-        req = SetEntityState.Request()
-        req.state        = EntityState()
-        req.state.name   = "car"   # nome dell'entità in Gazebo
-        req.state.pose   = pose
-
-        # Chiamata asincrona: non blocca il loop ROS
-        future = self._reset_client.call_async(req)
-        future.add_done_callback(self._on_reset_done)
-
-    def _on_reset_done(self, future):
         try:
-            result = future.result()
-            if not result.success:
-                self.get_logger().info(f"[TRAIN] Reset Gazebo fallito: {result.status_message}")
+            self.is_resetting = True
+
+            # ── 1. Ferma comandi ROS ────────────────────────────────────────
+            for _ in range(5):
+                self._publish_cmd(0.0, 0.0)
+                time.sleep(0.02)
+            
+            # ── 2. Pausa la fisica per evitare race condition durante remove/create
+            subprocess.run([
+                "gz", "service", "-s", "/world/line_tracking_race/control",
+                "--reqtype", "gz.msgs.WorldControl", "--reptype", "gz.msgs.Boolean",
+                "--timeout", "2000", "--req", "pause: true"
+            ], capture_output=True)
+            time.sleep(0.1)
+            
+            # ── 3. RIMUOVI l'entità car — azzera OGNI stato fisico interno ──
+            remove_cmd = [
+                "gz", "service",
+                "-s", "/world/line_tracking_race/remove",
+                "--reqtype", "gz.msgs.Entity",
+                "--reptype", "gz.msgs.Boolean",
+                "--timeout", "2000",
+                "--req", 'name: "car" type: MODEL'
+            ]
+            result = subprocess.run(remove_cmd, capture_output=True)
+
+            time.sleep(0.2)  # lascia che Gazebo elabori la rimozione
+
+            # ── 4. RICREA l'entità dal modello originale (SDF/URDF) ──────────
+            # sdf_filename deve puntare allo stesso file usato dal launch
+            # originale per lo spawn iniziale. Se hai usato robot_description
+            # via topic, qui serve il path al file SDF/URDF su disco.
+            create_cmd = [
+                "ros2", "run", "ros_gz_sim", "create",
+                "-topic", "/robot_description",
+                "-name", "car",
+                "-x", str(rx),
+                "-y", str(ry),
+                "-z", "0.45",
+                "-Y", str(ryaw)  # Yaw
+            ]
+            result = subprocess.run(create_cmd, capture_output=True)
+            if result.returncode != 0:
+                self.get_logger().error(f"[RESET] Create stderr: {result.stderr.decode()[:300]}")
+
+            time.sleep(0.3)  # lascia che Gazebo finisca di istanziare il modello
+
+            # ── 5. Riprendi la fisica ──────────────────────────────────────
+            subprocess.run([
+                "gz", "service", "-s", "/world/line_tracking_race/control",
+                "--reqtype", "gz.msgs.WorldControl", "--reptype", "gz.msgs.Boolean",
+                "--timeout", "2000", "--req", "pause: false"
+            ], capture_output=True)
+
+            # ── 6. Comando neutro per assestare ──────────────────────────────
+            time.sleep(0.1)
+            for _ in range(10):
+                self._publish_cmd(0.0, 0.0)
+                time.sleep(0.02)
+
+            # ── 7. Reset stato interno del nodo ──────────────────────────────
+            self.lost_line_counter    = 0
+            self.mpc._last_solution   = None
+            self.d = self.psi = self.gamma = 0.0
+            self.traj_poly             = np.zeros(3)
+            self.last_valid_d = self.last_valid_psi = self.last_valid_gamma = 0.0
+            self.last_valid_traj_poly  = np.zeros(3)
+            self.prev_centroid         = None
+            self.current_state         = np.array([rx, ry, ryaw])
+            self.is_resetting          = False
+
         except Exception as e:
-            self.get_logger().error(f"[TRAIN] Errore reset Gazebo: {e}")
+            self.is_resetting = False
+            self.get_logger().error(f"[RESET] Errore: {e}")
+            try:
+                subprocess.run([
+                    "gz", "service", "-s", "/world/line_tracking_race/control",
+                    "--reqtype", "gz.msgs.WorldControl", "--reptype", "gz.msgs.Boolean",
+                    "--timeout", "1000", "--req", "pause: false"
+                ], capture_output=True)
+            except Exception:
+                pass
 
     def _train_loop(self):
         """
@@ -455,12 +514,20 @@ class GeneticLineTracker(Node):
             # In attesa di nuovi pesi: robot fermo
             self._publish_cmd(0.0, 0.0)
             return
+        
+        # check per cadute dalla mappa
+        if (hasattr(self, 'lost_line_counter') and self.lost_line_counter > 10) or abs(self.d) > 1.0:
+            self.get_logger().warn("[TRAIN] Macchina deragliata o precipitata! Terminazione anticipata.")
+            self._eval_active = False
+            self._publish_eval_score(early_fail=True)
+            self._publish_cmd(0.0, 0.0)
+            return
 
         # Controlla se la valutazione è terminata
         elapsed = (self.get_clock().now() - self._eval_start_time).nanoseconds * 1e-9
         if elapsed >= self._eval_duration:
-            self._publish_eval_score()
             self._eval_active = False
+            self._publish_eval_score()
             self._publish_cmd(0.0, 0.0)
             return
 
@@ -471,25 +538,48 @@ class GeneticLineTracker(Node):
         # L'errore accumulato si basa direttamente sulle stime dalla visione
         self._accumulated_error += abs(self.d) + abs(self.psi)
         self._eval_steps        += 1
+        self._publish_error()
 
-    def _publish_eval_score(self):
+    def _publish_eval_score(self, early_fail=False):
         """Calcola la fitness media e la pubblica su /mpc_score."""
-        if self._eval_steps == 0:
+        
+        # Se c'è stata una terminazione anticipata per caduta
+        if early_fail:
+            # Calcoliamo la percentuale di sopravvivenza (es. 0.5 se è sopravvissuto a metà)
+            expected_steps = self._eval_duration / self.timer_update_frequency
+            survival_ratio = min(self._eval_steps / expected_steps, 1.0)
+            
+            # Penalità estrema: Punteggio tra 0.0001 e 0.01 (MOLTO minore di un giro completato)
+            fitness = 0.0001 + (0.01 * survival_ratio)
+            self.get_logger().error(
+                f"[TRAIN] FALLIMENTO GRAVE | Sopravvissuto: {survival_ratio*100:.1f}% | Fitness: {fitness:.4f}"
+            )
+            
+        # Altrimenti, calcolo normale per un giro completato
+        elif self._eval_steps == 0: #fail safe
             fitness = 0.0001
+            self.get_logger().error(
+                f"[TRAIN] eval steps == 0 | Fitness: {fitness:.4f}"
+            )
         else:
             mean_error = self._accumulated_error / self._eval_steps
             fitness    = 1.0 / (mean_error + 0.001) if mean_error < 1000 else 0.0001
+            self.get_logger().info(
+                f"[TRAIN] Valutazione completata - steps: {self._eval_steps} | "
+                f"errore medio: {self._accumulated_error / max(self._eval_steps, 1):.4f} | "
+                f"fitness: {fitness:.4f}"
+            )
 
         msg      = Float64()
         msg.data = fitness
         self.score_pub.publish(msg)
 
-        self.get_logger().info(
-            f"[TRAIN] Valutazione completata - steps: {self._eval_steps} | "
-            f"errore medio: {self._accumulated_error / max(self._eval_steps, 1):.4f} | "
-            f"fitness: {fitness:.4f}"
-        )
-
+    def _publish_error(self):
+        err_msg = Vector3()
+        err_msg.x = float(self.d)      # Errore laterale
+        err_msg.y = float(self.psi)    # Errore angolare
+        err_msg.z = float(self.gamma)  # Curvatura
+        self.error_pub.publish(err_msg)
 
 # ==================================================
 

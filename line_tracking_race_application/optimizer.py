@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 optimizer.py
 ============
@@ -30,6 +31,19 @@ import numpy as np
 import pygad
 
 from fitness_strategy import FitnessStrategy, OfflineFitnessStrategy, OnlineGazeboFitnessStrategy
+# Configurazione GA: indipendente dalla strategia
+GENE_SPACE = [
+    {"low": 0.5,  "high": 8.0},   # 0: w_d              — errore posizione laterale
+    {"low": 1.0,  "high": 8.0},   # 1: w_psi            — errore orientamento (floor 1.0)
+    {"low": 0.01, "high": 0.5},   # 2: w_effort         — penalità sterzata
+    {"low": 1.0,  "high": 5.0},   # 3: k_curve          — costante di frenata in curva
+    {"low": 0.2,  "high": 5.0},   # 4: w_v              — penalità velocità
+    {"low": 0.5,  "high": 3.0},   # 5: qf_mult_d        — moltiplicatore terminal cost su d
+    {"low": 0.5,  "high": 3.0},   # 6: qf_mult_psi      — moltiplicatore terminal cost su psi
+    {"low": 0.5,  "high": 2.5},   # 7: gamma_decay_start— metri di fiducia sulla curvatura
+]
+
+NUMBER_OF_THREAD = 4
 
 class _FitnessWrapper:
     """
@@ -37,30 +51,45 @@ class _FitnessWrapper:
     Definita a top-level così multiprocessing può serializzarla su Windows
     (spawn) oltre che su Linux (fork).
     """
-    def __init__(self, strategy: FitnessStrategy):
+    def __init__(self, strategy: FitnessStrategy, total_gens: int, pop_size: int):
         self.strategy = strategy
+        self.total_gens = total_gens
+        self.pop_size = pop_size
  
     def __call__(self, ga_instance, solution, solution_idx):
-        return self.strategy.evaluate(solution.tolist())
+        fitness = self.strategy.evaluate(solution.tolist())
 
-# Configurazione GA: indipendente dalla strategia
-GENE_SPACE = [
-    {"low": 0.5,  "high": 8.0},   # w_d         errore posizione laterale
-    {"low": 1.0,  "high": 8.0},   # w_psi       errore orientamento (floor a 1.0)
-    {"low": 0.01, "high": 0.5},   # w_effort    penalità sterzata
-    {"low": 0.01, "high": 2.0},   # w_v         penalità velocità
-]
+        #log della fitness calcolata
+        gen = ga_instance.generations_completed + 1
+        ind = solution_idx + 1 if isinstance(solution_idx, int) else "?"
+        pesi = [round(x, 3) for x in solution]
+        
+        # 3. Creiamo una SINGOLA stringa completa (il \n alla fine è obbligatorio)
+        msg = f"[Gen {gen}/{self.total_gens} | Ind {ind:2}/{self.pop_size}]\n\tPesi: {pesi} -> Fitness: {fitness:.4f}\n"
+        
+        # 4. Scrittura atomica thread-safe
+        if hasattr(self.strategy, "_node") and getattr(self.strategy, "_node", None) is not None:
+            # Se siamo online su Gazebo, usiamo il logger ROS 2 (senza il \n finale)
+            self.strategy.log(msg.strip())
+        else:
+            # Se siamo offline, usiamo la scrittura atomica su terminale
+            sys.stdout.write(msg)
+            sys.stdout.flush()
+
+        return fitness
+
+
 
 GA_PARAMS = dict(
     num_generations     = 50,
     keep_elitism        = 2,
     num_parents_mating  = 4,
-    sol_per_pop         = 20,
-    num_genes           = 4,
+    sol_per_pop         = 10,
+    num_genes           = len(GENE_SPACE),
     gene_space          = GENE_SPACE,
     crossover_type      = "uniform",
     mutation_type       = "adaptive",
-    mutation_num_genes  = (2, 1),
+    mutation_num_genes  = (3, 2),
     # parallel_processing viene aggiunto solo per la strategia offline
     # perché OnlineGazebo non è parallelizzabile (un solo Gazebo per processo)
 )
@@ -70,9 +99,11 @@ GA_PARAMS = dict(
 class _StagnationGuard:
     """Rileva stagnazione e inietta diversità nella popolazione."""
 
-    def __init__(self, patience: int = 6, n_inject: int = 3):
+    def __init__(self, strategy: FitnessStrategy, patience: int = 6, n_inject: int = 3, total_gens: int = 50):
+        self.strategy   = strategy
         self.patience   = patience
         self.n_inject   = n_inject
+        self.total_gens = total_gens
         self._counter   = 0
         self._last_best = 0.0
 
@@ -81,10 +112,12 @@ class _StagnationGuard:
         best_sol, best_fit, _ = ga_instance.best_solution()
 
         pop      = ga_instance.population
-        std_devs = [round(float(np.std(pop[:, g])), 4) for g in range(4)]
+        std_devs = [round(float(np.std(pop[:, g])), 4) for g in range(len(GENE_SPACE))]
         weights  = [round(float(x), 3) for x in best_sol]
 
-        print(f"[Gen {gen:3d}] Fitness: {best_fit:.4f} | Pesi: {weights} | StdDev: {std_devs}")
+        # Stampa il riassunto a fine generazione in maniera sincrona
+        msg = f">>> FINE GENERAZIONE {gen}/{self.total_gens} <<<\n\t| Miglior Fitness: {best_fit:.4f} |\n\t| Pesi ottimali: {weights} |\n\t| StdDev: {std_devs} |"
+        self.strategy.log(msg)
 
         if abs(best_fit - self._last_best) < 1e-4:
             self._counter += 1
@@ -98,7 +131,7 @@ class _StagnationGuard:
                 for g, space in enumerate(GENE_SPACE):
                     pop[-i, g] = np.random.uniform(space["low"], space["high"])
             self._counter = 0
-            print(f"  --> [Stagnazione] Iniezione diversità")
+            self.strategy.log(f"  --> [Stagnazione] Iniezione diversità")
 
 
 # Builder del GA
@@ -108,16 +141,20 @@ def build_ga(strategy: FitnessStrategy) -> pygad.GA:
     La OnlineGazebo disabilita il parallel_processing perché un solo
     Gazebo non può valutare più individui contemporaneamente.
     """
-    stagnation = _StagnationGuard(patience=6, n_inject=3)
+    total_gens = GA_PARAMS["num_generations"]
+    pop_size = GA_PARAMS["sol_per_pop"]
 
-    fitness_wrapper = _FitnessWrapper(strategy)
+    stagnation = _StagnationGuard(strategy, patience=6, n_inject=3, total_gens=total_gens)
+
+    fitness_wrapper = _FitnessWrapper(strategy, total_gens, pop_size)
 
     params = dict(GA_PARAMS)  # copia per non mutare il dict globale
     params["fitness_func"]    = fitness_wrapper
     params["on_generation"]   = stagnation
 
     if isinstance(strategy, OfflineFitnessStrategy):
-        params["parallel_processing"] = ["process", 6]
+        params["parallel_processing"] = ["process", NUMBER_OF_THREAD]
+        print(f"[OffLine Strategy] Setted {(params['parallel_processing'])[1]} parallel threads")
     # OnlineGazebo: nessun parallel_processing : il GA gira sequenzialmente
 
     return pygad.GA(**params)
@@ -174,6 +211,10 @@ def main():
         "--output", default="GeneticAlgorithmWeights",
         help="Nome base per i file di output .pkl e _meta.json"
     )
+    parser.add_argument(
+        "--eval_duration", type=float, default=20.0,
+        help="Durata della valutazione su Gazebo (secondi)"
+    )
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -182,30 +223,36 @@ def main():
     if args.strategy == "offline":
         strategy = OfflineFitnessStrategy()
     else:
-        strategy = OnlineGazeboFitnessStrategy()
+        strategy = OnlineGazeboFitnessStrategy(
+            eval_duration=args.eval_duration,
+            score_timeout=args.eval_duration * 3.0 + 30.0
+        )
 
-    print(f"Strategia: {strategy.name}")
-    print(f"Seed: {args.seed} | Output: {args.output}")
+    strategy.log(f"Strategia: {strategy.name}")
+    strategy.log(f"Seed: {args.seed} | Output: {args.output}")
 
     # Carica da checkpoint o costruisci da zero
     if args.resume:
-        print(f"Ripresa da checkpoint: {args.resume}")
+        strategy.log(f"Ripresa da checkpoint: {args.resume}")
         ga = pygad.load(args.resume)
         
-        ga.fitness_func   = _FitnessWrapper(strategy)
-        ga.on_generation  = _StagnationGuard(patience=6, n_inject=3)
+        total_gens = GA_PARAMS["num_generations"]
+        pop_size = GA_PARAMS["sol_per_pop"]
+        
+        ga.fitness_func   = _FitnessWrapper(strategy, total_gens, pop_size)
+        ga.on_generation  = _StagnationGuard(patience=6, n_inject=3, total_gens=total_gens)
     else:
         ga = build_ga(strategy)
 
     # Training
-    print(f"\nAvvio GA — strategia '{strategy.name}'")
+    strategy.log(f"\nAvvio GA — strategia '{strategy.name}'")
     ga.run()
 
     solution, fitness, _ = ga.best_solution()
-    print(f"\n== ALLENAMENTO COMPLETATO ==")
-    print(f"Fitness finale:  {fitness:.4f}")
-    print(f"Pesi ottimali [w_d, w_psi, w_effort, w_v]:")
-    print([round(float(x), 3) for x in solution])
+    strategy.log(f"\n== ALLENAMENTO COMPLETATO ==")
+    strategy.log(f"Fitness finale:  {fitness:.4f}")
+    strategy.log(f"Pesi ottimali [w_d, w_psi, w_effort, k_curve, w_v, qf_d, qf_psi, decay_start]:")
+    strategy.log([round(float(x), 3) for x in solution])
 
     save_checkpoint(ga, strategy, args.output, args.seed)
 

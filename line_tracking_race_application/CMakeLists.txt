@@ -9,6 +9,7 @@ install(PROGRAMS
   GeneticLineTracker.py
   model.py
   optimizer.py
+  fitness_strategy.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

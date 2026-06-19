@@ -36,7 +36,7 @@ class FitnessStrategy(ABC):
         Valuta la fitness di un set di pesi MPC.
         ________________________________________
         Parametri
-            weights : [w_d, w_psi, w_effort, w_v]
+            weights : [w_d, w_psi, w_effort, w_v, qf_mult_d, qf_mult_psi, gamma_decay_start]
         Returna
             float : fitness (valore più alto = robot migliore). Mai negativo.
         """
@@ -45,6 +45,10 @@ class FitnessStrategy(ABC):
     @abstractmethod
     def name(self) -> str:
         """Nome della strategia, usato nei log del GA."""
+
+    def log(self, msg: str):
+        """Metodo di logging base. Effettua un flush immediato sul terminale."""
+        print(msg, flush=True)
 
 # Strategia - Simulatore analitico offline
 class OfflineFitnessStrategy(FitnessStrategy):
@@ -100,7 +104,6 @@ class OfflineFitnessStrategy(FitnessStrategy):
     def evaluate(self, weights: List[float]) -> float:
         mpc = Model()
         mpc.set_weights(weights)
-
         total_error = 0.0
 
         for _ in range(self.n_noise_samples):
@@ -149,7 +152,7 @@ class OfflineFitnessStrategy(FitnessStrategy):
             psi_noisy   = (state[2] - theta_noisy + math.pi) % (2*math.pi) - math.pi
             gamma_noisy = (2 * noisy_poly[0]) / math.pow(1 + dy_dx_noisy**2, 1.5)
 
-            v_cmd, w_cmd = mpc.solve(np.array([0.0, d_noisy, psi_noisy]), gamma_noisy)
+            v_cmd, w_cmd = mpc.solve(np.array([0.0, d_noisy, psi_noisy]), gamma_noisy, np.array(noisy_poly))
 
             cmd_buffer.append((v_cmd, w_cmd))
             v_applied, w_applied = cmd_buffer.pop(0)
@@ -190,7 +193,7 @@ class OnlineGazeboFitnessStrategy(FitnessStrategy):
     │  optimizer.py                     GeneticLineTracker (TRAIN mode)    │
     │                                                                      │
     │  1. pubblica /mpc_weights ──────────────────────────────────────►    │
-    │     [w_d, w_psi, w_effort, w_v]   carica i pesi nel Model            │
+    │     [w_d, w_psi, w_effort, ...]   carica i pesi nel Model            │
     │                                   resetta stato interno              │
     │                                   resetta la posizione in Gazebo     │
     │                                   gira per eval_duration secondi     │
@@ -211,8 +214,8 @@ class OnlineGazeboFitnessStrategy(FitnessStrategy):
 
     def __init__(
         self,
-        eval_duration:  float = 15.0,
-        score_timeout:  float = 30.0,
+        eval_duration:  float = 20.0,
+        score_timeout:  float = 40.0,
         weights_topic:  str   = "/mpc_weights",
         score_topic:    str   = "/mpc_score",
     ):
@@ -229,9 +232,18 @@ class OnlineGazeboFitnessStrategy(FitnessStrategy):
         self._score_lock  = threading.Lock()
         self._score_event = threading.Event()
 
+        self._init_ros()
+
     @property
     def name(self) -> str:
         return "OnlineGazebo"
+    
+    def log(self, msg: str):
+        """Sovrascrive il log standard usando il logger nativo di ROS 2."""
+        if self._node is not None:
+            self._node.get_logger().info(msg)
+        else:
+            print(msg, flush=True)
 
     def _init_ros(self):
         """Inizializza il nodo ROS 2 minimalista per la comunicazione."""
@@ -271,6 +283,10 @@ class OnlineGazeboFitnessStrategy(FitnessStrategy):
         )
         self._spin_thread.start()
         self._ros_ready = True
+
+        # Attesa di 2.5 secondi per permettere ai topic ROS 2 di agganciarsi
+        import time
+        time.sleep(2.5)
 
     def _spin_forever(self):
         import rclpy
