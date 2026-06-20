@@ -64,8 +64,8 @@ class GeneticLineTracker(Node):
         self.should_visualize = True
 
         self.declare_parameter("mode",          "run")
-        #                                  [w_d, w_psi, w_effort, k_curve, w_v, Qf_mult_d, Qf_mult_psi, gamma_decay_start]
-        self.declare_parameter("weights",       [3.0, 3.0, 0.3, 2.5, 1.0, 1.0, 1.0, 1.5])
+        #                                  [w_d, w_psi, w_effort, k_curve, w_v, Qf_mult_d, Qf_mult_psi, gamma_decay_start, horizon]
+        self.declare_parameter("weights",       [3.0, 3.0, 0.3, 2.5, 1.0, 1.0, 1.0, 1.5, 20.0])
         self.declare_parameter("eval_duration", 15.0)
         self.declare_parameter("weights_topic", "/mpc_weights")
         self.declare_parameter("score_topic",   "/mpc_score")
@@ -228,7 +228,7 @@ class GeneticLineTracker(Node):
             d = self.last_valid_d
             psi = self.last_valid_psi
             gamma = self.last_valid_gamma
-            self.traj_poly = self.last_valid_traj_poly
+            traj_poly = self.last_valid_traj_poly
 
             # Se siamo ciechi, incrementiamo il contatore
             if hasattr(self, 'lost_line_counter'):
@@ -244,7 +244,7 @@ class GeneticLineTracker(Node):
             cv.imshow("Line Following Visualization", image)
             cv.waitKey(1)
 
-        return {"d": d, "psi": psi, "gamma": gamma}
+        return {"d": d, "psi": psi, "gamma": gamma, "traj_poly": traj_poly}
     
     # Credits: https://github.com/GioZerini
     def estimate_d_psi_gamma(self, mask, crosshair_px, robot_angle, K, image):
@@ -298,6 +298,11 @@ class GeneticLineTracker(Node):
                 x_robot = cam_offset_x + x_ground
                 y_robot = y_ground
                 
+                # ####################### CUSTOM CHECK ########################
+                MAX_SIGHT_DISTANCE = 3
+                if x_robot > MAX_SIGHT_DISTANCE:
+                    continue
+
                 pts_x.append(x_robot)
                 pts_y.append(y_robot)
                 
@@ -305,9 +310,12 @@ class GeneticLineTracker(Node):
         if len(pts_x) < 3:
             return None
             
+        # ####################### CUSTOM CHECK ########################
+        weights = [1.0 / (1.0 + px**2) for px in pts_x]
+
         # FIT POLINOMIALE LOCALE IN METRI
         # Ora i punti sono (X, Y) reali a terra. Il fit è y = ax^2 + bx + c
-        poly = np.polyfit(pts_x, pts_y, 2)
+        poly = np.polyfit(pts_x, pts_y, 2, w=weights)
         a, b, c = poly
         
         # ESTRAZIONE FRENET-SERRET (al muso del robot, X=0)
@@ -320,16 +328,35 @@ class GeneticLineTracker(Node):
         # gamma: Curvatura locale. gamma = y''(0) / (1 + y'(0)^2)^1.5
         gamma = float((2 * a) / math.pow(1 + b**2, 1.5))
         
-        # plot di info utili
-        cx_px, cy_px = crosshair_px
-        cv.circle(image, (int(cx_px), int(cy_px)), 5, (0, 255, 0), 2)
-        # Mostra dove il robot crede che sia la linea
-        for px, py in zip(pts_x, pts_y):
-            # Proiezione rudimentale indietro per il display
-            disp_y = int(cy + fy * (math.cos(pitch) * H - math.sin(pitch) * (px - cam_offset_x)) / (math.sin(pitch) * H + math.cos(pitch) * (px - cam_offset_x)))
-            disp_x = int(cx - fx * py / (math.sin(pitch) * H + math.cos(pitch) * (px - cam_offset_x)))
-            if 0 <= disp_x < w and 0 <= disp_y < h:
-                cv.circle(image, (disp_x, disp_y), 3, (0, 128, 255), -1)
+        # --- DISEGNO DELLA TRAIETTORIA ---
+        if self.should_visualize:
+            # 1. Polinomio Fittato (Linea Azzurra Continua)
+            # Campioniamo punti lungo X per mostrare la curva calcolata dal robot
+            x_samples = np.linspace(0.0, MAX_SIGHT_DISTANCE, 20)
+            prev_pt = None
+            for px in x_samples:
+                py_poly = a * (px**2) + b * px + c # La curva prevista
+                x_g = px - cam_offset_x
+                denom = math.sin(pitch) * H + math.cos(pitch) * x_g
+                if denom > 0.01:
+                    disp_y = int(cy + fy * (math.cos(pitch) * H - math.sin(pitch) * x_g) / denom)
+                    disp_x = int(cx - fx * py_poly / denom)
+                    if 0 <= disp_x < w and 0 <= disp_y < h:
+                        pt = (disp_x, disp_y)
+                        if prev_pt is not None:
+                            # Azzurro: (255, 255, 0) in BGR
+                            cv.line(image, prev_pt, pt, (255, 255, 0), 3)
+                        prev_pt = pt
+            
+            # 2. Punti estratti (Viola)
+            for px, py in zip(pts_x, pts_y):
+                x_g = px - cam_offset_x
+                denom = math.sin(pitch) * H + math.cos(pitch) * x_g
+                if denom > 0.01:
+                    disp_y = int(cy + fy * (math.cos(pitch) * H - math.sin(pitch) * x_g) / denom)
+                    disp_x = int(cx - fx * py / denom)
+                    if 0 <= disp_x < w and 0 <= disp_y < h:
+                        cv.circle(image, (disp_x, disp_y), 3, (255, 0, 255), -1)
 
         return d, psi, gamma, poly
 
@@ -359,6 +386,7 @@ class GeneticLineTracker(Node):
         self.d = res["d"]
         self.psi = res["psi"]
         self.gamma = res["gamma"]
+        self.traj_poly = res["traj_poly"]
 
     # Calcolo MPC (comune)
     def _solve_mpc(self):
@@ -402,7 +430,6 @@ class GeneticLineTracker(Node):
         Carica i pesi, resetta Gazebo e avvia una nuova valutazione.
         """
         weights = list(msg.data)
-        self.get_logger().info(f"[TRAIN] Nuovi pesi ricevuti:\n\t{[round(w, 3) for w in weights]}")
 
         self.mpc.set_weights(weights)
 
@@ -413,6 +440,7 @@ class GeneticLineTracker(Node):
         self._eval_steps        = 0
         self._eval_start_time   = self.get_clock().now()
         self._eval_active       = True
+        self.get_logger().info("\n\t[NEW EPISODE STARTING]")
 
     def _reset_gazebo_pose(self):
         import subprocess
@@ -432,7 +460,7 @@ class GeneticLineTracker(Node):
             subprocess.run([
                 "gz", "service", "-s", "/world/line_tracking_race/control",
                 "--reqtype", "gz.msgs.WorldControl", "--reptype", "gz.msgs.Boolean",
-                "--timeout", "2000", "--req", "pause: true"
+                "--timeout", "10000", "--req", "pause: true"
             ], capture_output=True)
             time.sleep(0.1)
             
@@ -442,7 +470,7 @@ class GeneticLineTracker(Node):
                 "-s", "/world/line_tracking_race/remove",
                 "--reqtype", "gz.msgs.Entity",
                 "--reptype", "gz.msgs.Boolean",
-                "--timeout", "2000",
+                "--timeout", "10000",
                 "--req", 'name: "car" type: MODEL'
             ]
             result = subprocess.run(remove_cmd, capture_output=True)
@@ -541,38 +569,49 @@ class GeneticLineTracker(Node):
         self._publish_error()
 
     def _publish_eval_score(self, early_fail=False):
-        """Calcola la fitness media e la pubblica su /mpc_score."""
-        
-        # Se c'è stata una terminazione anticipata per caduta
-        if early_fail:
-            # Calcoliamo la percentuale di sopravvivenza (es. 0.5 se è sopravvissuto a metà)
-            expected_steps = self._eval_duration / self.timer_update_frequency
-            survival_ratio = min(self._eval_steps / expected_steps, 1.0)
-            
-            # Penalità estrema: Punteggio tra 0.0001 e 0.01 (MOLTO minore di un giro completato)
-            fitness = 0.0001 + (0.01 * survival_ratio)
+        """
+        Calcola la fitness media e la pubblica su /mpc_score.
+    
+        Usa la stessa logica dell'OfflineFitnessStrategy:
+        - ogni step "mancante" rispetto alla durata attesa costa
+            PENALTY_PER_MISSED_STEP, sommato all'errore accumulato
+        - un'unica formula 1/(mean_error + 0.001) per tutti i casi
+            (completamento, fallimento anticipato, zero step)
+        """
+        expected_steps = round(self._eval_duration / self.timer_update_frequency)
+        PENALTY_PER_MISSED_STEP = 5
+        if self._eval_steps == 0:
+            # fail safe: nessuno step eseguito, trattalo come se fossero
+            # mancati tutti gli step attesi
+            missed_steps = expected_steps
+            total_error  = missed_steps * PENALTY_PER_MISSED_STEP
+            fitness      = 1.0 / (total_error + 0.001) if total_error < 1000 else 0.0001
             self.get_logger().error(
-                f"[TRAIN] FALLIMENTO GRAVE | Sopravvissuto: {survival_ratio*100:.1f}% | Fitness: {fitness:.4f}"
-            )
-            
-        # Altrimenti, calcolo normale per un giro completato
-        elif self._eval_steps == 0: #fail safe
-            fitness = 0.0001
-            self.get_logger().error(
-                f"[TRAIN] eval steps == 0 | Fitness: {fitness:.4f}"
+                f"[TRAIN] eval steps == 0 | fitness: {fitness:.4f}"
             )
         else:
-            mean_error = self._accumulated_error / self._eval_steps
-            fitness    = 1.0 / (mean_error + 0.001) if mean_error < 1000 else 0.0001
-            self.get_logger().info(
-                f"[TRAIN] Valutazione completata - steps: {self._eval_steps} | "
-                f"errore medio: {self._accumulated_error / max(self._eval_steps, 1):.4f} | "
-                f"fitness: {fitness:.4f}"
-            )
-
+            missed_steps = max(expected_steps - self._eval_steps, 0)
+            total_error  = self._accumulated_error + (missed_steps * PENALTY_PER_MISSED_STEP)
+            mean_error   = total_error / expected_steps  # normalizza sempre sulla durata attesa
+    
+            fitness = 1.0 / (mean_error + 0.001) if mean_error < 1000 else 0.0001
+    
+            if early_fail:
+                self.get_logger().error(
+                    f"[TRAIN] FALLIMENTO GRAVE | steps: {self._eval_steps}/{expected_steps} | "
+                    f"missed: {missed_steps} | errore accumulato: {self._accumulated_error:.4f} | "
+                    f"errore medio (penalizzato): {mean_error:.4f} | fitness: {fitness:.4f}"
+                )
+            else:
+                self.get_logger().info(
+                    f"[TRAIN] Valutazione completata - steps: {self._eval_steps}/{expected_steps} | "
+                    f"errore medio: {mean_error:.4f} | fitness: {fitness:.4f}"
+                )
+    
         msg      = Float64()
         msg.data = fitness
         self.score_pub.publish(msg)
+        self._reset_gazebo_pose()
 
     def _publish_error(self):
         err_msg = Vector3()

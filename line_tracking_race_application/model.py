@@ -25,7 +25,7 @@ class Model:
 
         # limiti fisici del veicolo
         self.v_max = 2.0                # m/s
-        self.w_max = 1.0                # rad/s
+        self.w_max = 4.0                # rad/s
 
         self._last_solution = None
         
@@ -37,9 +37,10 @@ class Model:
           self.weight_v,
           self.Qf_multiplier_d,
           self.Qf_multiplier_psi,
-          self.gamma_decay_start
+          self.gamma_decay_start,
+          w_horizon
         ) = weights
- 
+        self.horizon = int(w_horizon)
         # Margine fisso tra decay_start e decay_end: evita di esporre
         # un ottavo gene e garantisce sempre end > start per costruzione.
         self.gamma_decay_end = self.gamma_decay_start + 1.5
@@ -70,7 +71,7 @@ class Model:
             return 0.0
             
         # Calcolo della curvatura usando i coefficienti a, b
-        gamma = (2 * a) / math.pow(1 + (2 * a * sigma + b)**2, 1.5)
+        gamma = float((2 * a) / math.pow(1 + b**2, 1.5))
         
         # Oltre un certo limite (es. 1.5m), ci si fida meno del fit e sfuma verso 0
         t = (sigma - self.gamma_decay_start) / (self.gamma_decay_end - self.gamma_decay_start)
@@ -85,12 +86,13 @@ class Model:
         cost = 0.0
         sigma, d, psi = current_state
         gamma = gamma_0
+        x_proj = 0.0
         
         # scomposizione in coppie (v, w)
         v_seq = controls[0::2]
         w_seq = controls[1::2]
 
-        for i in range(self.horizon):
+        for i in range(int(self.horizon)):
             v = v_seq[i]
             w = w_seq[i]
             
@@ -99,7 +101,7 @@ class Model:
             denom = 1.0 - d * gamma
             #if abs(denom) < 1e-3:
             #    denom = 1e-3 if denom >= 0 else -1e-3
-            denom = max(0.01, denom)
+            denom = max(0.2, denom)
 
             # Modello Discretizzato (Forward Euler: q(k+1) = q(k) + Ts·q̇(k))
             # in Frenet-Serret
@@ -110,7 +112,8 @@ class Model:
             
             sigma, d, psi = sigma_next, d_next, psi_next
             # approssimazione di x(σ)≈σ⋅cos(ψ)
-            gamma = self.gamma_function(sigma*math.cos(psi), gamma_0) #aggiornamento di gamma nella previsione (col valore aggiornato di sigma)
+            x_proj = x_proj + self.dt * (v * math.cos(psi))
+            gamma = self.gamma_function(x_proj, gamma_0) #aggiornamento di gamma nella previsione (col valore aggiornato di sigma)
 
             # Calcolo del running cost l(x, u)
             # l(x,u) = 1/2 (x_ref - x)^T Q (x_ref - x) + 1/2 u^T R u  + 1/2 W_v (v_target - v)^2
@@ -146,8 +149,7 @@ class Model:
  
         bounds = []
         for _ in range(self.horizon):
-            bounds.append((-0.5, 0.5))    # v in [-v_max, v_max]
-            #bounds.append((-self.v_max, self.v_max))    # v in [-v_max, v_max]
+            bounds.append((0.0, self.v_max))    # v in [-v_max, v_max]
             bounds.append((-self.w_max, self.w_max))    # w in [-w_max, w_max]
  
         self.traj_poly = traj_poly

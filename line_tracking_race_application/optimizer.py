@@ -33,14 +33,15 @@ import pygad
 from fitness_strategy import FitnessStrategy, OfflineFitnessStrategy, OnlineGazeboFitnessStrategy
 # Configurazione GA: indipendente dalla strategia
 GENE_SPACE = [
-    {"low": 0.5,  "high": 8.0},   # 0: w_d              — errore posizione laterale
-    {"low": 1.0,  "high": 8.0},   # 1: w_psi            — errore orientamento (floor 1.0)
-    {"low": 0.01, "high": 0.5},   # 2: w_effort         — penalità sterzata
-    {"low": 1.0,  "high": 5.0},   # 3: k_curve          — costante di frenata in curva
-    {"low": 0.2,  "high": 5.0},   # 4: w_v              — penalità velocità
-    {"low": 0.5,  "high": 3.0},   # 5: qf_mult_d        — moltiplicatore terminal cost su d
-    {"low": 0.5,  "high": 3.0},   # 6: qf_mult_psi      — moltiplicatore terminal cost su psi
-    {"low": 0.5,  "high": 2.5},   # 7: gamma_decay_start— metri di fiducia sulla curvatura
+    {"low": 1.0,  "high": 15.0},  # 0: w_d              - errore posizione laterale
+    {"low": 1.0,  "high": 15.0},  # 1: w_psi            - errore orientamento (floor 1.0)
+    {"low": 0.01, "high": 0.5},   # 2: w_effort         - penalità sterzata
+    {"low": 5.0,  "high": 25.0},  # 3: k_curve          - costante di frenata in curva
+    {"low": 0.01, "high": 1.0},   # 4: w_v              - penalità velocità
+    {"low": 1.0,  "high": 5.0},   # 5: qf_mult_d        - moltiplicatore terminal cost su d
+    {"low": 1.0,  "high": 5.0},   # 6: qf_mult_psi      - moltiplicatore terminal cost su psi
+    {"low": 0.5,  "high": 2.0},   # 7: gamma_decay_start- metri di fiducia sulla curvatura
+    {"low": 10.0, "high": 40.0}   # 8: horizon          - passi di previsione nel futuro
 ]
 
 NUMBER_OF_THREAD = 4
@@ -77,7 +78,6 @@ class _FitnessWrapper:
             sys.stdout.flush()
 
         return fitness
-
 
 
 GA_PARAMS = dict(
@@ -245,7 +245,7 @@ def main():
         ga = build_ga(strategy)
 
     # Training
-    strategy.log(f"\nAvvio GA — strategia '{strategy.name}'")
+    strategy.log(f"\nAvvio GA - strategia '{strategy.name}'")
     ga.run()
 
     solution, fitness, _ = ga.best_solution()

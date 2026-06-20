@@ -71,18 +71,14 @@ class OfflineFitnessStrategy(FitnessStrategy):
         noise_std:        tuple  = (0.005, 0.02, 0.05),
         n_noise_samples:  int    = 3,
         cmd_delay:        int    = 2,
-        training_steps:   int    = 25,
+        training_steps:   int    = 300,
         track_half_width: float  = 1.0,
-        soft_margin:      float  = 0.7,
-        out_penalty:      float  = 2.0,
     ):
         self.noise_std_a, self.noise_std_b, self.noise_std_c = noise_std
         self.n_noise_samples  = n_noise_samples
         self.cmd_delay        = cmd_delay
         self.training_steps   = training_steps
         self.track_half_width = track_half_width
-        self.soft_margin      = soft_margin
-        self.out_penalty      = out_penalty
 
         # Scenari: (target_poly, initial_state)
         # Definiti qui una volta sola — aggiungi/rimuovi scenari in questo punto.
@@ -95,6 +91,10 @@ class OfflineFitnessStrategy(FitnessStrategy):
             ([0.05, 0.0, 0.0], np.array([0.0,  0.3, 0.2])),
             # Scenario 4 — Curva stretta (stress test)
             ([0.15, 0.0, 0.0], np.array([0.0,  0.2, 0.1])),
+            # Scenario 5 — Curva parabolica dolce con offset e angolo
+            ([0.05, 0.0, 0.0], np.array([0.0,  -0.3, -0.2])),
+            # Scenario 6 — Curva stretta (stress test)
+            ([0.15, 0.0, 0.0], np.array([0.0,  -0.2, -0.1])),
         ]
 
     @property
@@ -104,7 +104,9 @@ class OfflineFitnessStrategy(FitnessStrategy):
     def evaluate(self, weights: List[float]) -> float:
         mpc = Model()
         mpc.set_weights(weights)
+        
         total_error = 0.0
+        total_expected_steps = 0
 
         for _ in range(self.n_noise_samples):
             na = np.random.normal(0, self.noise_std_a)
@@ -117,9 +119,11 @@ class OfflineFitnessStrategy(FitnessStrategy):
                     target_poly[1] + nb,
                     target_poly[2] + nc,
                 ]
-                total_error += self._simulate_scenario(mpc, init_state, target_poly, noisy_poly)
+                err, expected_steps = self._simulate_scenario(mpc, init_state, target_poly, noisy_poly)
+                total_error += err
+                total_expected_steps += expected_steps
 
-        mean_error = total_error / self.n_noise_samples
+        mean_error = total_error / total_expected_steps
         # controllo sull'esplosione del risultato
         if math.isnan(mean_error) or mean_error > 1000:
             return 0.0001
@@ -132,7 +136,7 @@ class OfflineFitnessStrategy(FitnessStrategy):
         init_state:  np.ndarray,
         target_poly: List[float],
         noisy_poly:  List[float],
-    ) -> float:
+    ) -> tuple[float, int]:
         """
         Simula un singolo scenario con latenza dei comandi e rumore.
         Il robot percepisce 'noisy_poly', si muove con cinematica reale,
@@ -141,6 +145,9 @@ class OfflineFitnessStrategy(FitnessStrategy):
         state           = init_state.copy()
         cmd_buffer      = [(0.0, 0.0)] * self.cmd_delay
         scenario_error  = 0.0
+        actual_steps    = 0
+        expected_steps  = self.training_steps
+
         target_poly_der = np.polyder(target_poly)
 
         for step in range(self.training_steps):
@@ -170,16 +177,19 @@ class OfflineFitnessStrategy(FitnessStrategy):
             y_err   = abs(state[1] - y_target)
             psi_err = abs((state[2] - theta_target + math.pi) % (2 * math.pi) - math.pi)
             
-            # penalita' progressiva se ci si allontana dal soft margin
-            lateral_excess = max(0.0, abs(state[1]) - self.soft_margin)
-            scenario_error += y_err + psi_err + 5.0 * lateral_excess
+            scenario_error += (y_err + psi_err)
+            actual_steps   += 1
+
             # terminazione anticipata se si cade dal rettilinio
             if abs(state[1]) > self.track_half_width:
-                remaining = self.training_steps - step - 1
-                scenario_error += self.out_penalty * remaining
                 break
 
-        return scenario_error
+        # Penalità unificata per gli step mancanti
+        PENALTY_PER_MISSED_STEP = 5.0
+        missed_steps = expected_steps - actual_steps
+        total_scenario_error = scenario_error + (missed_steps * PENALTY_PER_MISSED_STEP)
+
+        return total_scenario_error, expected_steps
 
 
 # Strategia 2 — Valutazione online su Gazebo
