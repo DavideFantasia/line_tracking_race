@@ -169,6 +169,7 @@ def generate_launch_description():
         # -s -> server only (headless mode, NO GUI)
         # -v -> verbose
         # -r -> start simulation (required by ros2_control)
+        #'gz_args': [world_file, " -r -v 1"],
         'gz_args': [world_file, " -s -r -v 1"],
         'on_exit_shutdown': 'True'
     }.items(),
@@ -221,21 +222,22 @@ def generate_launch_description():
        condition=IfCondition(LaunchConfiguration('rviz'))
     )
 
-    # ========================= ARGOMENTI CUSTOM =====================
+    # =================== ARGOMENTI CUSTOM =====================
     mode_arg = DeclareLaunchArgument(
         'mode', default_value='run', 
         description='Modalita del tracker: run o train'
     )
     
     weights_arg = DeclareLaunchArgument(
-        #'weights', default_value= '[6.556, 4.466, 0.447, 4.637, 1.442, 2.156, 1.396, 1.579]',#online training
-        #'weights', default_value= '[7.392, 6.926, 0.446, 4.562, 0.28, 0.763, 1.245, 2.064]', #offline training 
-        'weights', default_value='[300.0, 300.0, 0.3, 2.0, 1.0, 1.0, 1.0, 1.5]', 
-        description='Pesi MPC [w_d, w_psi, w_effort, k_curve, w_v, qf_mult_d, qf_mult_psi, gamma_decay_start]'
+        #'weights', default_value= '[7.047, 1.288, 0.485, 21.649, 0.22, 1.028, 2.824, 1.678, 25.322]',#online training
+        'weights', default_value= '[7.047, 1.288, 0.485, 15.649, 5.22, 1.028, 2.824, 1.678, 25.322]',
+        #'weights', default_value= '[6.405, 6.995, 0.45, 18.45, 0.093, 2.315, 1.138, 0.956, 38.0]', #offline training 
+        #'weights', default_value='[3.0, 3.0, 0.75, 5.0, 5.0, 1.0, 1.0, 2.5, 20.0]', 
+        description='Pesi MPC [w_d, w_psi, w_effort, k_curve, w_v, qf_mult_d, qf_mult_psi, gamma_decay_start, horizon]'
     )
 
     eval_duration_arg = DeclareLaunchArgument(
-        'eval_duration', default_value='20.0', # in secondi
+        'eval_duration', default_value='30.0', # in secondi
         description='Secondi per la valutazione del GA'
     )
 
