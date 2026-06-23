@@ -169,8 +169,8 @@ def generate_launch_description():
         # -s -> server only (headless mode, NO GUI)
         # -v -> verbose
         # -r -> start simulation (required by ros2_control)
-        #'gz_args': [world_file, " -r -v 1"],
-        'gz_args': [world_file, " -s -r -v 1"],
+        'gz_args': [world_file, " -r -v 1"],
+        #'gz_args': [world_file, " -s -r -v 1"],
         'on_exit_shutdown': 'True'
     }.items(),
     )
@@ -230,7 +230,8 @@ def generate_launch_description():
     
     weights_arg = DeclareLaunchArgument(
         #'weights', default_value= '[7.047, 1.288, 0.485, 21.649, 0.22, 1.028, 2.824, 1.678, 25.322]',#online training
-        'weights', default_value= '[7.047, 1.288, 0.485, 15.649, 5.22, 1.028, 2.824, 1.678, 25.322]',
+        'weights', default_value= '[7.047, 1.288, 0.485, 5.649, 5.22, 1.028, 2.824, 1.678, 25.322]',
+        #'weights', default_value= '[7.0, 1.0, 0.5, 2.0, 5.0, 1.0, 2.5, 1.5, 25.0]',
         #'weights', default_value= '[6.405, 6.995, 0.45, 18.45, 0.093, 2.315, 1.138, 0.956, 38.0]', #offline training 
         #'weights', default_value='[3.0, 3.0, 0.75, 5.0, 5.0, 1.0, 1.0, 2.5, 20.0]', 
         description='Pesi MPC [w_d, w_psi, w_effort, k_curve, w_v, qf_mult_d, qf_mult_psi, gamma_decay_start, horizon]'
