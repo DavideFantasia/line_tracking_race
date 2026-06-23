@@ -75,6 +75,7 @@ class Model:
         
         # Oltre un certo limite (es. 1.5m), ci si fida meno del fit e sfuma verso 0
         t = (sigma - self.gamma_decay_start) / (self.gamma_decay_end - self.gamma_decay_start)
+
         return gamma * (1.0 - t)
 
 

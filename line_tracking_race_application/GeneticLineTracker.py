@@ -82,13 +82,14 @@ class GeneticLineTracker(Node):
         )
 
         # Publisher/subscriber comuni ad entrambe le modalità
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self.error_pub = self.create_publisher(Vector3, "/tracking_error", 10)
-        self.odom_sub = self.create_subscription(Odometry, "/odom", self._odom_callback, 10)
+        QUEUE_DIMENSION = 10
+        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", QUEUE_DIMENSION)
+        self.error_pub = self.create_publisher(Vector3, "/tracking_error", QUEUE_DIMENSION)
+        self.odom_sub = self.create_subscription(Odometry, "/odom", self._odom_callback, QUEUE_DIMENSION)
 
         self.bridge = CvBridge()
-        self.image_sub = self.create_subscription(Image, "/camera/image_raw", self._image_callback, 10)
-        self.camera_info_sub = self.create_subscription(CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
+        self.image_sub = self.create_subscription(Image, "/camera/image_raw", self._image_callback, QUEUE_DIMENSION)
+        self.camera_info_sub = self.create_subscription(CameraInfo, "/camera/camera_info", self._camera_info_callback, QUEUE_DIMENSION)
 
 
         self.camera_height = 0.57  
@@ -266,7 +267,7 @@ class GeneticLineTracker(Node):
         h, w = mask.shape
         pts_x = []
         pts_y = []
-        
+
         # Scansiona l'immagine dal basso (vicino al robot) verso metà altezza
         crop_start = int(h * 0.4)
         for v in range(h - 1, crop_start, -15):
@@ -276,7 +277,7 @@ class GeneticLineTracker(Node):
             if len(whites) > 0:
                 # Trova il centro della linea in pixel (u)
                 u = np.mean(whites)
-                
+
                 # PROIEZIONE 3D: PIXEL -> METRI SUL SUOLO
                 # Vettore del raggio normalizzato nel frame ottico
                 nx = (u - cx) / fx
@@ -309,10 +310,20 @@ class GeneticLineTracker(Node):
         # Se non ci sono abbastanza punti, ritorna 0
         if len(pts_x) < 3:
             return None
-            
+        
+        if len(pts_x) >= 4:
+            # Fit preliminare senza pesi per identificare outlier grossolani
+            poly_prelim = np.polyfit(pts_x, pts_y, 2)
+            residuals = [abs(py - np.polyval(poly_prelim, px)) for px, py in zip(pts_x, pts_y)]
+            threshold = 0.15  # metri — scarta punti che deviano più di 15cm dal fit preliminare
+
+            filtered = [(px, py) for px, py, r in zip(pts_x, pts_y, residuals) if r < threshold]
+            if len(filtered) >= 3:
+                pts_x, pts_y= zip(*filtered)
+                pts_x, pts_y= list(pts_x), list(pts_y)
+
         # ####################### CUSTOM CHECK ########################
         weights = [1.0 / (1.0 + px**2) for px in pts_x]
-
         # FIT POLINOMIALE LOCALE IN METRI
         # Ora i punti sono (X, Y) reali a terra. Il fit è y = ax^2 + bx + c
         poly = np.polyfit(pts_x, pts_y, 2, w=weights)
